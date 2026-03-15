@@ -24,7 +24,7 @@ if not os.path.exists(LOG_FILE):
             "Water (mL)",
             "Agar (g)",
             "Salt (g)",
-            "Sugar/Glycerol (g)",
+            "Sugar (g)",
             "Container Shape",
             "Container Diameter (cm)",
             "Container Height (cm)",
@@ -35,7 +35,7 @@ if not os.path.exists(LOG_FILE):
 # === INPUT PHANTOM DETAILS ===
 print("\n=== PULMO AI PHANTOM LOGGER ===\n")
 
-phantom_id = input("Phantom ID (e.g., H001, T001): ").strip()
+phantom_id = input("Phantom ID (e.g., A, B, C): ").strip()
 phantom_type = input("Type (Healthy / Tumor): ").strip().capitalize()
 water = float(input("Water volume (mL): "))
 agar = float(input("Agar powder (g): "))
