@@ -1,7 +1,6 @@
 # full_phantom_scan.py
 """
 COMPLETE PHANTOM SCANNING PROTOCOL
-Run this script and follow the prompts
 """
 import serial
 import time
@@ -11,10 +10,10 @@ from datetime import datetime
 import os
 
 # Configuration
-VNA_PORT = 'COM4'  # Change if needed
+VNA_PORT = 'COM4'  
 FREQ_START = 2e9
 FREQ_STOP = 3e9
-NUM_POINTS = 201  # Your current setting
+NUM_POINTS = 201  
 
 # Path configurations
 PATHS = [
@@ -64,7 +63,7 @@ def scan_path(vna, path_num, path_name):
     print(f"  Scanning Path {path_num} ({path_name})...", end='', flush=True)
     
     vna.write(b':sweep:data? s21\r\n')
-    time.sleep(1)  # Wait for sweep
+    time.sleep(1)  # Waits for sweep
     
     data = vna.readline()
     if data:
@@ -162,7 +161,7 @@ def main():
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
         
-        # Ask if user wants to continue
+        # Ask if I want to continue
         if cond_idx < len(CONDITIONS):
             response = input("\nContinue to next condition? (y/n): ")
             if response.lower() != 'y':
