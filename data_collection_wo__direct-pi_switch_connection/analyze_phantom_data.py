@@ -1,6 +1,7 @@
 # analyze_phantom_data.py
 """
 Analyzes all phantom data and creates comparison plots
+Run from the folder containing your phantom_data_* folders
 """
 import numpy as np
 import pandas as pd
@@ -15,10 +16,12 @@ def load_condition_data(folder):
     frequencies = None
     
     csv_files = sorted(Path(folder).glob('*.csv'))
+    print(f"    Found {len(csv_files)} CSV files")
+    
     for f in csv_files:
         df = pd.read_csv(f)
         if frequencies is None:
-            frequencies = df['Frequency_Hz'].values / 1e9  # Converts to GHz
+            frequencies = df['Frequency_Hz'].values / 1e9  # Convert to GHz
         data.append(df['S21_dB'].values)
     
     if data:
@@ -28,10 +31,20 @@ def load_condition_data(folder):
 def main():
     if len(sys.argv) < 2:
         print("Usage: python analyze_phantom_data.py <data_folder>")
+        print("Example: python analyze_phantom_data.py phantom_data_20260322_172408")
         return
     
     base_folder = sys.argv[1]
-    print(f"\n=== ANALYZING DATA FROM: {base_folder} ===\n")
+    
+    # Check if folder exists
+    if not os.path.exists(base_folder):
+        print(f"❌ Folder not found: {base_folder}")
+        print(f"   Make sure you're in the right directory")
+        return
+    
+    print(f"\n{'='*70}")
+    print(f" ANALYZING DATA FROM: {base_folder}")
+    print(f"{'='*70}\n")
     
     # Define conditions in order
     conditions = [
@@ -46,16 +59,18 @@ def main():
     frequencies = None
     
     for condition in conditions:
-        folder = f"{base_folder}/{condition}"
+        folder = os.path.join(base_folder, condition)
         if os.path.exists(folder):
+            print(f"📂 Loading {condition}...")
             data, freqs = load_condition_data(folder)
             if data is not None:
                 all_data[condition] = data
                 if frequencies is None:
                     frequencies = freqs
-                print(f"✅ Loaded {condition}: {data.shape[0]} paths, {data.shape[1]} points each")
+                print(f"   ✅ {data.shape[0]} scans, {data.shape[1]} points each")
+                print(f"   📊 S21 range: {np.min(data):.1f} to {np.max(data):.1f} dB")
             else:
-                print(f"⚠️  No data found for {condition}")
+                print(f"   ⚠️  No data found")
         else:
             print(f"⚠️  Folder not found: {condition}")
     
@@ -64,6 +79,7 @@ def main():
         return
     
     # Create comparison plots
+    print("\n📊 Generating plots...")
     plt.style.use('seaborn-v0_8-darkgrid')
     colors = ['blue', 'green', 'orange', 'red']
     labels = ['Air Baseline', 'Healthy #1', 'Healthy #2', 'Tumor']
@@ -102,14 +118,16 @@ def main():
     
     plt.xlabel('Frequency (GHz)', fontsize=12)
     plt.ylabel('S21 (dB)', fontsize=12)
-    plt.title('PULMO AI: Phantom Data Comparison\n(Average of 4 paths ± std dev)', 
+    plt.title('PULMO AI: Phantom Data Comparison\n(Average of all scans ± std dev)', 
               fontsize=14, fontweight='bold')
     plt.grid(True, alpha=0.3)
     plt.legend(loc='upper right')
     plt.ylim(-50, 0)
     plt.tight_layout()
-    plt.savefig(f'{base_folder}/comparison_all_conditions.png', dpi=300)
-    print(f"\n📊 Saved: comparison_all_conditions.png")
+    plot1_path = os.path.join(base_folder, 'comparison_all_conditions.png')
+    plt.savefig(plot1_path, dpi=300)
+    print(f"✅ Saved: {plot1_path}")
+    plt.close()
     
     # Plot 2: Individual paths for tumor condition
     if '04_tumor_phantom' in all_data:
@@ -118,47 +136,85 @@ def main():
         path_colors = ['blue', 'green', 'orange', 'red']
         
         tumor_data = all_data['04_tumor_phantom']
-        for i in range(min(4, tumor_data.shape[0])):
-            plt.plot(frequencies, tumor_data[i], color=path_colors[i],
-                    label=path_labels[i], linewidth=2)
+        # Group by path (assuming files are in order: path1, path2, path3, path4, then rotations)
+        # For each rotation, we have 4 files. Let's average across rotations for each path
+        num_rotations = tumor_data.shape[0] // 4
+        print(f"\n   Found {num_rotations} rotations (3 expected)")
+        
+        for path_idx in range(4):
+            # Average all scans for this path across rotations
+            path_scans = tumor_data[path_idx::4]  # Every 4th file starting at path_idx
+            avg_path = np.mean(path_scans, axis=0)
+            plt.plot(frequencies, avg_path, color=path_colors[path_idx],
+                    label=path_labels[path_idx], linewidth=2)
         
         plt.xlabel('Frequency (GHz)', fontsize=12)
         plt.ylabel('S21 (dB)', fontsize=12)
-        plt.title('PULMO AI: Tumor Phantom - All 4 Paths', fontsize=14, fontweight='bold')
+        plt.title('PULMO AI: Tumor Phantom - All 4 Paths (Averaged Across Rotations)', 
+                  fontsize=14, fontweight='bold')
         plt.grid(True, alpha=0.3)
         plt.legend()
         plt.ylim(-50, 0)
         plt.tight_layout()
-        plt.savefig(f'{base_folder}/tumor_all_paths.png', dpi=300)
-        print("📊 Saved: tumor_all_paths.png")
+        plot2_path = os.path.join(base_folder, 'tumor_all_paths.png')
+        plt.savefig(plot2_path, dpi=300)
+        print(f"✅ Saved: {plot2_path}")
+        plt.close()
     
     # Print statistics
-    print("\n📊 KEY STATISTICS:")
-    print("-" * 50)
+    print("\n" + "="*70)
+    print("📊 KEY STATISTICS")
+    print("="*70)
     
+    # Calculate averages for each condition
+    for condition in ['01_baseline_air', '02_healthy_phantom_1', '03_healthy_phantom_2', '04_tumor_phantom']:
+        if condition in all_data:
+            avg_all = np.mean(all_data[condition])
+            std_all = np.std(all_data[condition])
+            name = condition.replace('_', ' ').title()
+            print(f"\n{name}:")
+            print(f"  Mean S21: {avg_all:.2f} ± {std_all:.2f} dB")
+            print(f"  Min: {np.min(all_data[condition]):.2f} dB")
+            print(f"  Max: {np.max(all_data[condition]):.2f} dB")
+    
+    # Tumor detection analysis
     if '01_baseline_air' in all_data and '04_tumor_phantom' in all_data:
-        baseline_avg = np.mean(all_data['01_baseline_air'])
-        tumor_avg = np.mean(all_data['04_tumor_phantom'])
-        total_drop = baseline_avg - tumor_avg
+        baseline_all = np.mean(all_data['01_baseline_air'])
+        tumor_all = np.mean(all_data['04_tumor_phantom'])
+        total_drop = baseline_all - tumor_all
         
-        print(f"Average S21 (all frequencies, all paths):")
-        print(f"  Air Baseline:  {baseline_avg:.2f} dB")
-        print(f"  Tumor Phantom: {tumor_avg:.2f} dB")
-        print(f"  Total Drop:    {total_drop:.2f} dB")
+        print(f"\n{'='*70}")
+        print("🎯 TUMOR DETECTION ANALYSIS")
+        print("="*70)
+        print(f"Air Baseline Average:  {baseline_all:.2f} dB")
+        print(f"Tumor Phantom Average: {tumor_all:.2f} dB")
+        print(f"Total Signal Drop:     {total_drop:.2f} dB")
         
         if total_drop >= 4.9:
-            print("\n✅ TUMOR DETECTED! (>4.9 dB threshold)")
+            print("\n✅✅✅ TUMOR DETECTED! (>4.9 dB threshold) ✅✅✅")
         else:
-            print("\n⚠️  Tumor signal below threshold")
+            print(f"\n⚠️  Tumor signal ({total_drop:.2f} dB) below 4.9 dB threshold")
+            print("   Check: Is tumor simulant properly embedded?")
     
-    # Calculate path-to-path variation for tumor
+    # Path-to-path variation
     if '04_tumor_phantom' in all_data:
-        tumor_std = np.std(np.mean(all_data['04_tumor_phantom'], axis=1))
-        print(f"\nPath-to-path variation (tumor): ±{tumor_std:.2f} dB")
-        print("  (Higher variation = better spatial sensitivity)")
+        path_means = []
+        for path_idx in range(4):
+            path_scans = all_data['04_tumor_phantom'][path_idx::4]
+            path_means.append(np.mean(path_scans))
+        path_std = np.std(path_means)
+        print(f"\nPath-to-path variation: ±{path_std:.2f} dB")
+        if path_std > 2:
+            print("  ✅ Good spatial sensitivity - tumor affects different paths differently")
+        else:
+            print("  ⚠️  Low spatial variation - tumor may be centered or small")
     
-    print("\n✅ Analysis complete!")
+    print("\n" + "="*70)
+    print("✅ ANALYSIS COMPLETE!")
     print(f"📁 All plots saved in: {base_folder}/")
+    print(f"   - comparison_all_conditions.png")
+    print(f"   - tumor_all_paths.png")
+    print("="*70)
 
 if __name__ == "__main__":
     main()
