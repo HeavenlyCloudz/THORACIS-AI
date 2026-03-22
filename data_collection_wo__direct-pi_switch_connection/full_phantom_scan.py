@@ -18,7 +18,7 @@ NUM_POINTS = 201
 # SCANNING CONFIGURATION
 SCANS_PER_CONDITION = 3      # Number of repeat scans (IMPERATIVE for reproducibility)
 ROTATIONS = [0, 120, 240]    # Rotation angles in degrees (optional, for spatial variation)
-USE_ROTATIONS = False         # Set to True if you can rotate phantoms
+USE_ROTATIONS = True         
 
 # ============= PATH CONFIGURATIONS =============
 PATHS = [
