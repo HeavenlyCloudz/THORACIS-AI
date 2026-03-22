@@ -1,6 +1,6 @@
 # full_phantom_scan.py
 """
-COMPLETE PHANTOM SCANNING PROTOCOL
+COMPLETE PHANTOM SCANNING PROTOCOL - WITH MULTIPLE SCANS
 """
 import serial
 import time
@@ -9,13 +9,18 @@ import numpy as np
 from datetime import datetime
 import os
 
-# Configuration
-VNA_PORT = 'COM4'  
+# ============= CONFIGURATION =============
+VNA_PORT = 'COM4' 
 FREQ_START = 2e9
 FREQ_STOP = 3e9
-NUM_POINTS = 201  
+NUM_POINTS = 201
 
-# Path configurations
+# SCANNING CONFIGURATION
+SCANS_PER_CONDITION = 3      # Number of repeat scans (IMPERATIVE for reproducibility)
+ROTATIONS = [0, 120, 240]    # Rotation angles in degrees (optional, for spatial variation)
+USE_ROTATIONS = False         # Set to True if you can rotate phantoms
+
+# ============= PATH CONFIGURATIONS =============
 PATHS = [
     {'num': 1, 'name': '1→3', 'tx': 'RF1=+5V, RF2=GND', 'rx': 'RF1=+5V, RF2=GND'},
     {'num': 2, 'name': '1→4', 'tx': 'RF1=+5V, RF2=GND', 'rx': 'RF1=GND, RF2=+5V'},
@@ -23,7 +28,7 @@ PATHS = [
     {'num': 4, 'name': '2→4', 'tx': 'RF1=GND, RF2=+5V', 'rx': 'RF1=GND, RF2=+5V'}
 ]
 
-# Test conditions
+# ============= TEST CONDITIONS =============
 CONDITIONS = [
     {
         'name': '01_baseline_air',
@@ -63,7 +68,7 @@ def scan_path(vna, path_num, path_name):
     print(f"  Scanning Path {path_num} ({path_name})...", end='', flush=True)
     
     vna.write(b':sweep:data? s21\r\n')
-    time.sleep(1)  # Waits for sweep
+    time.sleep(1)  # Wait for sweep
     
     data = vna.readline()
     if data:
@@ -74,13 +79,18 @@ def scan_path(vna, path_num, path_name):
         print(" ❌ No data")
         return None
 
-def save_data(values, folder, path_num, path_name):
-    """Save data to CSV file"""
+def save_data(values, folder, path_num, path_name, run_num, rotation=None):
+    """Save data to CSV file with run number and rotation"""
     if not values:
         return False
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{folder}/path{path_num}_{path_name}_{timestamp}.csv"
+    
+    # Build filename with metadata
+    if rotation is not None:
+        filename = f"{folder}/path{path_num}_{path_name}_run{run_num}_rot{rotation}_{timestamp}.csv"
+    else:
+        filename = f"{folder}/path{path_num}_{path_name}_run{run_num}_{timestamp}.csv"
     
     with open(filename, 'w', newline='') as f:
         writer = csv.writer(f)
@@ -96,7 +106,7 @@ def save_data(values, folder, path_num, path_name):
             except:
                 pass
     
-    print(f"    💾 Saved: {filename} ({valid_points} points)")
+    print(f"    💾 Saved: {os.path.basename(filename)} ({valid_points} points)")
     return True
 
 def print_header(text):
@@ -115,14 +125,45 @@ def show_switch_guide():
         print(f"  RX: {path['rx']}")
     print("-" * 50)
 
+def quick_quality_check(condition_folder):
+    """Quick check to verify data was saved correctly"""
+    import glob
+    
+    csv_files = glob.glob(f"{condition_folder}/*.csv")
+    if len(csv_files) >= 4:
+        print(f"    ✅ Quality check: {len(csv_files)} files saved")
+        return True
+    else:
+        print(f"    ⚠️ Quality check: Only {len(csv_files)} files (expected 4 per run)")
+        return False
+
 def main():
     print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL")
+    print(f"\n📊 SCANNING CONFIGURATION:")
+    print(f"   • Repeat scans per condition: {SCANS_PER_CONDITION}")
+    if USE_ROTATIONS:
+        print(f"   • Rotations: {ROTATIONS}")
+    else:
+        print(f"   • Rotations: Disabled")
     
     # Create main folder
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_folder = f"phantom_data_{timestamp}"
     os.makedirs(base_folder, exist_ok=True)
-    print(f"📁 Main folder: {base_folder}")
+    print(f"\n📁 Main folder: {base_folder}")
+    
+    # Create metadata file
+    with open(f"{base_folder}/scan_metadata.txt", 'w') as f:
+        f.write("PULMO AI PHANTOM SCANNING METADATA\n")
+        f.write("="*50 + "\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Scans per condition: {SCANS_PER_CONDITION}\n")
+        f.write(f"Rotations: {ROTATIONS if USE_ROTATIONS else 'None'}\n")
+        f.write(f"Frequency range: {FREQ_START/1e9:.1f}-{FREQ_STOP/1e9:.1f} GHz\n")
+        f.write(f"Points per sweep: {NUM_POINTS}\n\n")
+        f.write("Conditions:\n")
+        for cond in CONDITIONS:
+            f.write(f"  - {cond['name']}: {cond['description']}\n")
     
     # Show switch guide
     show_switch_guide()
@@ -131,6 +172,10 @@ def main():
     vna = connect_vna()
     if not vna:
         return
+    
+    # Track statistics
+    total_scans = 0
+    successful_scans = 0
     
     # Run through each condition
     for cond_idx, condition in enumerate(CONDITIONS, 1):
@@ -142,45 +187,81 @@ def main():
         cond_folder = f"{base_folder}/{condition['name']}"
         os.makedirs(cond_folder, exist_ok=True)
         
-        input("\nPress ENTER when ready to start this condition...")
+        # Determine rotation list
+        rotations_to_use = ROTATIONS if USE_ROTATIONS else [None]
         
-        # Scan all 4 paths for this condition
-        for path in PATHS:
-            print(f"\n  Path {path['num']} of 4")
-            print(f"  Set TX: {path['tx']}")
-            print(f"  Set RX: {path['rx']}")
-            input("    Press ENTER after setting switches...")
-            
-            # Small settling delay
-            time.sleep(0.5)
-            
-            # Scan and save
-            values = scan_path(vna, path['num'], path['name'])
-            if values:
-                save_data(values, cond_folder, path['num'], path['name'])
+        for rotation in rotations_to_use:
+            for run_num in range(1, SCANS_PER_CONDITION + 1):
+                if rotation is not None:
+                    print(f"\n🔄 Rotation: {rotation}° | Run {run_num}/{SCANS_PER_CONDITION}")
+                else:
+                    print(f"\n📸 Run {run_num}/{SCANS_PER_CONDITION}")
+                
+                total_scans += 1
+                
+                # Scan all 4 paths for this run
+                run_successful = True
+                for path in PATHS:
+                    print(f"\n  Path {path['num']} of 4")
+                    print(f"  Set TX: {path['tx']}")
+                    print(f"  Set RX: {path['rx']}")
+                    input("    Press ENTER after setting switches...")
+                    
+                    # Small settling delay
+                    time.sleep(0.5)
+                    
+                    # Scan and save
+                    values = scan_path(vna, path['num'], path['name'])
+                    if values:
+                        save_success = save_data(values, cond_folder, path['num'], 
+                                                path['name'], run_num, rotation)
+                        if not save_success:
+                            run_successful = False
+                    else:
+                        run_successful = False
+                
+                if run_successful:
+                    successful_scans += 1
+                    # Quick quality check
+                    quick_quality_check(cond_folder)
+                else:
+                    print(f"  ⚠️ Run {run_num} had errors")
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
         
-        # Ask if I want to continue
+        # Ask if user wants to continue
         if cond_idx < len(CONDITIONS):
             response = input("\nContinue to next condition? (y/n): ")
             if response.lower() != 'y':
-                print("\n⚠️  Stopping early. Partial data saved.")
+                print("\n⚠️ Stopping early. Partial data saved.")
                 break
     
     vna.close()
     
+    # Final summary
     print_header("SCANNING COMPLETE!")
     print(f"📁 All data saved in: {base_folder}")
-    print("\nFolder structure:")
+    print(f"\n📊 SCAN SUMMARY:")
+    print(f"   • Total scans attempted: {total_scans}")
+    print(f"   • Successful scans: {successful_scans}")
+    print(f"   • Success rate: {successful_scans/total_scans*100:.1f}%")
+    
+    print("\n📁 Folder structure:")
     for condition in CONDITIONS:
         path = f"{base_folder}/{condition['name']}"
         if os.path.exists(path):
             files = len([f for f in os.listdir(path) if f.endswith('.csv')])
-            print(f"  📁 {condition['name']}: {files} files")
+            expected = SCANS_PER_CONDITION * 4 * (len(ROTATIONS) if USE_ROTATIONS else 1)
+            print(f"  📁 {condition['name']}: {files}/{expected} CSV files")
     
     print("\n🔍 NEXT STEP: Run analysis script")
     print(f"python analyze_phantom_data.py {base_folder}")
+    
+    print("\n💡 TIP: For science fair, mention:")
+    print(f"   • Collected {SCANS_PER_CONDITION} repeat scans per condition")
+    if USE_ROTATIONS:
+        print(f"   • Tested {len(ROTATIONS)} different orientations")
+    print(f"   • Total measurements: {successful_scans * 4} individual S21 traces")
 
 if __name__ == "__main__":
     main()
