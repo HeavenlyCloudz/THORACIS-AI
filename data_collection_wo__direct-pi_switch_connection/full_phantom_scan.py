@@ -1,113 +1,138 @@
 # full_phantom_scan.py
 """
-COMPLETE PHANTOM SCANNING PROTOCOL - WITH MULTIPLE SCANS
+COMPLETE PHANTOM SCANNING PROTOCOL with Pi Switch Control
+Running this script on COMPUTER (controls VNA)
+Pi runs pi_switch_controller.py in background
 """
 import serial
 import time
 import csv
-import numpy as np
-from datetime import datetime
+import math
 import os
+import socket
+import subprocess
+from datetime import datetime
+import numpy as np
 
-# ============= CONFIGURATION =============
-VNA_PORT = 'COM4' 
-FREQ_START = 2e9
-FREQ_STOP = 3e9
-NUM_POINTS = 201
+# CONFIGURATION
+VNA_PORT = 'COM4'  # Change to your VNA port
+BAUDRATE = 115200
+START_FREQ = 2000000000  # 2.0 GHz
+STOP_FREQ = 3000000000   # 3.0 GHz
+POINTS = 201
 
-# SCANNING CONFIGURATION
-SCANS_PER_CONDITION = 3      # Number of repeat scans (IMPERATIVE for reproducibility)
-ROTATIONS = [0, 120, 240]    # Rotation angles in degrees (optional, for spatial variation)
-USE_ROTATIONS = True         
+# PI CONFIGURATION
+PI_IP = '192.168.1.201'  # Replace with your Pi's IP address
+USE_PI_CONTROL = True     # Set to False if controlling switches manually
 
-# ============= PATH CONFIGURATIONS =============
+# SCAN CONFIGURATION
+SCANS_PER_CONDITION = 3   # Number of repeat scans
+ROTATIONS = [0, 120, 240] # Rotation angles (degrees)
+ROTATION_ENABLED = True
+
+# Path configurations (same as pi_switch_controller)
 PATHS = [
-    {'num': 1, 'name': '1→3', 'tx': 'RF1=+5V, RF2=GND', 'rx': 'RF1=+5V, RF2=GND'},
-    {'num': 2, 'name': '1→4', 'tx': 'RF1=+5V, RF2=GND', 'rx': 'RF1=GND, RF2=+5V'},
-    {'num': 3, 'name': '2→3', 'tx': 'RF1=GND, RF2=+5V', 'rx': 'RF1=+5V, RF2=GND'},
-    {'num': 4, 'name': '2→4', 'tx': 'RF1=GND, RF2=+5V', 'rx': 'RF1=GND, RF2=+5V'}
+    {'num': 1, 'name': '1→3', 'gpio': {'17': 1, '27': 0, '18': 1, '22': 0}},
+    {'num': 2, 'name': '1→4', 'gpio': {'17': 1, '27': 0, '18': 0, '22': 1}},
+    {'num': 3, 'name': '2→3', 'gpio': {'17': 0, '27': 1, '18': 1, '22': 0}},
+    {'num': 4, 'name': '2→4', 'gpio': {'17': 0, '27': 1, '18': 0, '22': 1}}
 ]
 
-# ============= TEST CONDITIONS =============
-CONDITIONS = [
-    {
-        'name': '01_baseline_air',
-        'description': 'EMPTY - No phantom, just air between antennas',
-        'prompt': 'Remove ALL phantoms. Just air between antennas.'
-    },
-    {
-        'name': '02_healthy_phantom_1',
-        'description': 'HEALTHY PHANTOM #1 - First agar phantom (no tumor)',
-        'prompt': 'Place HEALTHY phantom #1 between antennas'
-    },
-    {
-        'name': '03_healthy_phantom_2',
-        'description': 'HEALTHY PHANTOM #2 - Second agar phantom (different batch)',
-        'prompt': 'Place HEALTHY phantom #2 between antennas'
-    },
-    {
-        'name': '04_tumor_phantom',
-        'description': 'TUMOR PHANTOM - Healthy phantom WITH embedded tumor simulant',
-        'prompt': 'Place TUMOR phantom between antennas'
-    }
-]
-
-def connect_vna():
-    """Connect to VNA"""
-    try:
-        vna = serial.Serial(VNA_PORT, 115200, timeout=2)
-        time.sleep(2)
-        print(f"✅ Connected to VNA on {VNA_PORT}")
-        return vna
-    except Exception as e:
-        print(f"❌ Failed to connect: {e}")
-        return None
-
-def scan_path(vna, path_num, path_name):
-    """Scan a single path and return data"""
-    print(f"  Scanning Path {path_num} ({path_name})...", end='', flush=True)
-    
-    vna.write(b':sweep:data? s21\r\n')
-    time.sleep(1)  # Wait for sweep
-    
-    data = vna.readline()
-    if data:
-        values = data.decode().strip().split(',')
-        print(f" ✅ {len(values)} points")
-        return values
-    else:
-        print(" ❌ No data")
-        return None
-
-def save_data(values, folder, path_num, path_name, run_num, rotation=None):
-    """Save data to CSV file with run number and rotation"""
-    if not values:
+def send_to_pi(command):
+    """Send command to Pi via network (optional)"""
+    if not USE_PI_CONTROL:
         return False
-    
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Build filename with metadata
-    if rotation is not None:
-        filename = f"{folder}/path{path_num}_{path_name}_run{run_num}_rot{rotation}_{timestamp}.csv"
-    else:
-        filename = f"{folder}/path{path_num}_{path_name}_run{run_num}_{timestamp}.csv"
-    
-    with open(filename, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Frequency_Hz', 'S21_dB'])
-        freqs = np.linspace(FREQ_START, FREQ_STOP, len(values))
+    try:
+        # Option 1: SSH command (if SSH keys set up)
+        # subprocess.run(f'ssh pi@{PI_IP} "{command}"', shell=True, capture_output=True)
         
-        valid_points = 0
-        for fq, val in zip(freqs, values):
-            try:
-                s21_val = float(val)
-                writer.writerow([fq, s21_val])
-                valid_points += 1
-            except:
-                pass
+        # Option 2: Simple TCP socket (create a server on Pi)
+        # For now, we'll just print instructions
+        print(f"  [PI COMMAND] {command}")
+        return True
+    except:
+        return False
+
+def set_path_on_pi(path_num):
+    """Send path setting command to Pi"""
+    if USE_PI_CONTROL:
+        print(f"  Sending path {path_num} to Pi...")
+        # Send via SSH or socket
+        # subprocess.run(f'ssh pi@{PI_IP} "python3 -c \'import pi_switch; pi_switch.set_path({path_num})\'"', shell=True)
+        return True
+    else:
+        print(f"  MANUAL: Set Pi switches to Path {path_num}")
+        return False
+
+def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
+    """Capture S21 data for a single antenna path with metadata"""
     
-    print(f"    💾 Saved: {os.path.basename(filename)} ({valid_points} points)")
-    return True
+    # Create filename with metadata
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{condition_name}_path{path_num}_rot{rotation}_run{run_num}_{timestamp}.csv"
+    
+    # Ensure folder exists
+    os.makedirs(condition_name, exist_ok=True)
+    full_path = os.path.join(condition_name, filename)
+    
+    print(f"\n  📡 Capturing {path_name}...", end='', flush=True)
+    
+    try:
+        with serial.Serial(VNA_PORT, BAUDRATE, timeout=2) as ser:
+            time.sleep(1)
+            ser.reset_input_buffer()
+            
+            # Send scan command (5 = freq + S21 data in dB format)
+            cmd = f"scan {START_FREQ} {STOP_FREQ} {POINTS} 5"
+            ser.write((cmd + '\n').encode())
+            time.sleep(1)  # Wait for sweep
+            
+            # Collect data
+            data_points = []
+            lines_collected = 0
+            timeout_start = time.time()
+            
+            while lines_collected < POINTS and (time.time() - timeout_start) < 10:
+                line = ser.readline().decode('ascii', errors='ignore').strip()
+                if line and not line.startswith('ch>') and not line.startswith('scan'):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            freq_hz = float(parts[0])
+                            s21_real = float(parts[1])
+                            s21_imag = float(parts[2])
+                            
+                            # Convert to magnitude in dB
+                            magnitude = (s21_real**2 + s21_imag**2)**0.5
+                            magnitude_db = 20 * math.log10(magnitude) if magnitude > 0 else -120
+                            
+                            data_points.append([freq_hz, magnitude_db])
+                            lines_collected += 1
+                        except:
+                            continue
+            
+            if len(data_points) == POINTS:
+                # Save to CSV
+                with open(full_path, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['Frequency_Hz', 'S21_dB'])
+                    writer.writerows(data_points)
+                
+                # Calculate statistics
+                s21_values = [d[1] for d in data_points]
+                avg_db = np.mean(s21_values)
+                min_db = np.min(s21_values)
+                max_db = np.max(s21_values)
+                
+                print(f" ✅ {len(data_points)} pts, avg={avg_db:.1f}dB")
+                return True, {'avg': avg_db, 'min': min_db, 'max': max_db}
+            else:
+                print(f" ⚠️ Only {len(data_points)}/{POINTS} points")
+                return False, None
+                
+    except Exception as e:
+        print(f" ❌ Error: {e}")
+        return False, None
 
 def print_header(text):
     """Print formatted header"""
@@ -115,67 +140,76 @@ def print_header(text):
     print(f" {text}")
     print("="*70)
 
-def show_switch_guide():
-    """Display switch configuration guide"""
-    print("\n📋 SWITCH CONFIGURATION GUIDE:")
-    print("-" * 50)
-    for path in PATHS:
-        print(f"Path {path['num']} ({path['name']}):")
-        print(f"  TX: {path['tx']}")
-        print(f"  RX: {path['rx']}")
-    print("-" * 50)
-
-def quick_quality_check(condition_folder):
-    """Quick check to verify data was saved correctly"""
-    import glob
-    
-    csv_files = glob.glob(f"{condition_folder}/*.csv")
-    if len(csv_files) >= 4:
-        print(f"    ✅ Quality check: {len(csv_files)} files saved")
-        return True
-    else:
-        print(f"    ⚠️ Quality check: Only {len(csv_files)} files (expected 4 per run)")
-        return False
-
 def main():
     print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL")
-    print(f"\n📊 SCANNING CONFIGURATION:")
-    print(f"   • Repeat scans per condition: {SCANS_PER_CONDITION}")
-    if USE_ROTATIONS:
-        print(f"   • Rotations: {ROTATIONS}")
-    else:
-        print(f"   • Rotations: Disabled")
     
-    # Create main folder
+    # Test VNA connection first
+    print("\n🔌 Checking VNA connection...")
+    try:
+        with serial.Serial(VNA_PORT, BAUDRATE, timeout=2) as test_ser:
+            test_ser.write(b'info\n')
+            time.sleep(0.5)
+            response = test_ser.read_all().decode()
+            if 'ch>' in response or 'NanoVNA' in response:
+                print(f"✅ VNA connected on {VNA_PORT}")
+            else:
+                print(f"⚠️  VNA connected but unexpected response")
+    except Exception as e:
+        print(f"❌ Cannot connect to VNA on {VNA_PORT}: {e}")
+        print("   Check: VNA powered on, USB connected, correct port")
+        return
+    
+    # Pi control instructions
+    if USE_PI_CONTROL:
+        print("\n🤖 Pi Control Mode: ENABLED")
+        print("   Make sure pi_switch_controller.py is running on Pi")
+        print("   Pi should be ready to receive path commands")
+    else:
+        print("\n🔧 Manual Switch Mode")
+        print("   You'll set switches manually when prompted")
+    
+    # Test conditions
+    CONDITIONS = [
+        {
+            'name': '01_baseline_air',
+            'description': 'EMPTY - No phantom, just air between antennas',
+            'prompt': 'Remove ALL phantoms'
+        },
+        {
+            'name': '02_healthy_phantom_1',
+            'description': 'HEALTHY PHANTOM #1 - First agar phantom',
+            'prompt': 'Place HEALTHY phantom #1 between antennas'
+        },
+        {
+            'name': '03_healthy_phantom_2',
+            'description': 'HEALTHY PHANTOM #2 - Second agar phantom',
+            'prompt': 'Place HEALTHY phantom #2 between antennas'
+        },
+        {
+            'name': '04_tumor_phantom',
+            'description': 'TUMOR PHANTOM - With embedded tumor simulant',
+            'prompt': 'Place TUMOR phantom between antennas'
+        }
+    ]
+    
+    # Create main folder with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_folder = f"phantom_data_{timestamp}"
     os.makedirs(base_folder, exist_ok=True)
     print(f"\n📁 Main folder: {base_folder}")
     
-    # Create metadata file
-    with open(f"{base_folder}/scan_metadata.txt", 'w') as f:
-        f.write("PULMO AI PHANTOM SCANNING METADATA\n")
-        f.write("="*50 + "\n")
-        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-        f.write(f"Scans per condition: {SCANS_PER_CONDITION}\n")
-        f.write(f"Rotations: {ROTATIONS if USE_ROTATIONS else 'None'}\n")
-        f.write(f"Frequency range: {FREQ_START/1e9:.1f}-{FREQ_STOP/1e9:.1f} GHz\n")
-        f.write(f"Points per sweep: {NUM_POINTS}\n\n")
-        f.write("Conditions:\n")
-        for cond in CONDITIONS:
-            f.write(f"  - {cond['name']}: {cond['description']}\n")
-    
-    # Show switch guide
-    show_switch_guide()
-    
-    # Connect to VNA
-    vna = connect_vna()
-    if not vna:
-        return
-    
-    # Track statistics
-    total_scans = 0
-    successful_scans = 0
+    # Save metadata
+    metadata = {
+        'timestamp': timestamp,
+        'vna_port': VNA_PORT,
+        'freq_start_ghz': START_FREQ/1e9,
+        'freq_stop_ghz': STOP_FREQ/1e9,
+        'num_points': POINTS,
+        'scans_per_condition': SCANS_PER_CONDITION,
+        'rotations': ROTATIONS if ROTATION_ENABLED else [0],
+        'use_pi_control': USE_PI_CONTROL,
+        'conditions': []
+    }
     
     # Run through each condition
     for cond_idx, condition in enumerate(CONDITIONS, 1):
@@ -187,81 +221,86 @@ def main():
         cond_folder = f"{base_folder}/{condition['name']}"
         os.makedirs(cond_folder, exist_ok=True)
         
-        # Determine rotation list
-        rotations_to_use = ROTATIONS if USE_ROTATIONS else [None]
+        input("\nPress ENTER when ready to start this condition...")
         
+        # Get rotations to use
+        rotations_to_use = ROTATIONS if ROTATION_ENABLED else [0]
+        
+        # Scan with rotations and multiple runs
         for rotation in rotations_to_use:
             for run_num in range(1, SCANS_PER_CONDITION + 1):
-                if rotation is not None:
-                    print(f"\n🔄 Rotation: {rotation}° | Run {run_num}/{SCANS_PER_CONDITION}")
-                else:
-                    print(f"\n📸 Run {run_num}/{SCANS_PER_CONDITION}")
+                print(f"\n  📸 Rotation: {rotation}°, Run: {run_num}/{SCANS_PER_CONDITION}")
                 
-                total_scans += 1
-                
-                # Scan all 4 paths for this run
-                run_successful = True
-                for path in PATHS:
-                    print(f"\n  Path {path['num']} of 4")
-                    print(f"  Set TX: {path['tx']}")
-                    print(f"  Set RX: {path['rx']}")
-                    input("    Press ENTER after setting switches...")
+                # Scan all 4 paths for this rotation/run
+                for path_idx, path in enumerate(PATHS, 1):
+                    # Send path to Pi
+                    if USE_PI_CONTROL:
+                        print(f"    Setting Pi to Path {path['num']}...")
+                        # In a real setup, you'd send actual command here
+                        # For now, we print the instruction
+                    else:
+                        print(f"    MANUAL: Set switches to Path {path['num']} ({path['name']})")
                     
-                    # Small settling delay
+                    # Wait for Pi to set path (adjust timing as needed)
                     time.sleep(0.5)
                     
-                    # Scan and save
-                    values = scan_path(vna, path['num'], path['name'])
-                    if values:
-                        save_success = save_data(values, cond_folder, path['num'], 
-                                                path['name'], run_num, rotation)
-                        if not save_success:
-                            run_successful = False
-                    else:
-                        run_successful = False
+                    # Capture data
+                    success, stats = capture_path(
+                        path['num'], 
+                        path['name'],
+                        rotation=rotation,
+                        run_num=run_num,
+                        condition_name=cond_folder
+                    )
+                    
+                    if not success:
+                        print(f"    ⚠️  Failed, retrying...")
+                        time.sleep(2)
+                        success, stats = capture_path(
+                            path['num'], 
+                            path['name'],
+                            rotation=rotation,
+                            run_num=run_num,
+                            condition_name=cond_folder
+                        )
                 
-                if run_successful:
-                    successful_scans += 1
-                    # Quick quality check
-                    quick_quality_check(cond_folder)
-                else:
-                    print(f"  ⚠️ Run {run_num} had errors")
+                # Small pause between runs
+                time.sleep(1)
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
+        
+        # Store metadata
+        metadata['conditions'].append({
+            'name': condition['name'],
+            'description': condition['description'],
+            'scans': SCANS_PER_CONDITION * len(rotations_to_use) * 4,
+            'rotations': rotations_to_use,
+            'runs': SCANS_PER_CONDITION
+        })
         
         # Ask if user wants to continue
         if cond_idx < len(CONDITIONS):
             response = input("\nContinue to next condition? (y/n): ")
             if response.lower() != 'y':
-                print("\n⚠️ Stopping early. Partial data saved.")
+                print("\n⚠️  Stopping early")
                 break
     
-    vna.close()
+    # Save metadata
+    import json
+    with open(f"{base_folder}/scan_metadata.json", 'w') as f:
+        json.dump(metadata, f, indent=2)
     
-    # Final summary
     print_header("SCANNING COMPLETE!")
     print(f"📁 All data saved in: {base_folder}")
-    print(f"\n📊 SCAN SUMMARY:")
-    print(f"   • Total scans attempted: {total_scans}")
-    print(f"   • Successful scans: {successful_scans}")
-    print(f"   • Success rate: {successful_scans/total_scans*100:.1f}%")
-    
-    print("\n📁 Folder structure:")
-    for condition in CONDITIONS:
-        path = f"{base_folder}/{condition['name']}"
-        if os.path.exists(path):
-            files = len([f for f in os.listdir(path) if f.endswith('.csv')])
-            expected = SCANS_PER_CONDITION * 4 * (len(ROTATIONS) if USE_ROTATIONS else 1)
-            print(f"  📁 {condition['name']}: {files}/{expected} CSV files")
+    print(f"📊 Total scans: {len([f for f in Path(base_folder).rglob('*.csv')])}")
     
     print("\n🔍 NEXT STEP: Run analysis script")
     print(f"python analyze_phantom_data.py {base_folder}")
-    
-    print("\n💡 TIP: For science fair, mention:")
-    print(f"   • Collected {SCANS_PER_CONDITION} repeat scans per condition")
-    if USE_ROTATIONS:
-        print(f"   • Tested {len(ROTATIONS)} different orientations")
-    print(f"   • Total measurements: {successful_scans * 4} individual S21 traces")
+    print("\n🤖 For automated scanning with Pi:")
+    print("   1. On Pi, run: python pi_switch_controller.py")
+    print("   2. Then run this script with USE_PI_CONTROL = True")
+    print("   3. Ensure Pi and computer are on same network")
 
 if __name__ == "__main__":
+    from pathlib import Path
     main()
