@@ -23,8 +23,8 @@ POINTS = 201
 
 # PI SSH CONFIGURATION
 PI_IP = '192.168.1.201'  
-PI_USER = 'havil'         
-PI_PASSWORD = '510270516'  
+PI_USER = 'anik'         
+PI_PASSWORD = 'iloverollerchic'  
 USE_SSH = True            
 
 # SCAN CONFIGURATION
