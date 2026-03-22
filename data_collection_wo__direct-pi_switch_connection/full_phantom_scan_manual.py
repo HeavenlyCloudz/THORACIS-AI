@@ -1,15 +1,14 @@
-# full_phantom_scan.py
+# full_phantom_scan_manual.py
 """
-COMPLETE PHANTOM SCANNING PROTOCOL
-Script runs on COMPUTER (controls VNA)
-Pi controls switches via SSH calling pi_switch_controller.py
+COMPLETE PHANTOM SCANNING PROTOCOL - MANUAL MODE
+Run this on your COMPUTER
+You'll manually set paths on Pi when prompted
 """
 import serial
 import time
 import csv
 import math
 import os
-import subprocess
 from datetime import datetime
 import numpy as np
 from pathlib import Path
@@ -21,135 +20,18 @@ START_FREQ = 2000000000  # 2.0 GHz
 STOP_FREQ = 3000000000   # 3.0 GHz
 POINTS = 201
 
-# PI SSH CONFIGURATION
-PI_IP = '192.168.1.201'  
-PI_USER = 'anik'         
-PI_PASSWORD = 'iloverollerchic'  
-USE_SSH = True            
-
 # SCAN CONFIGURATION
 SCANS_PER_CONDITION = 3   # Number of repeat scans
 ROTATIONS = [0, 120, 240] # Rotation angles (degrees)
-ROTATION_ENABLED = False   # Set to True if you have rotation capability
+ROTATION_ENABLED = True   # Set to True if you have rotation capability
 
-def send_to_pi_ssh(command):
-    """Send command to Pi via SSH with password authentication"""
-    if not USE_SSH:
-        return False
-    
-    try:
-        # Using sshpass for password authentication
-        result = subprocess.run(
-            f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0:
-            return True
-        else:
-            if result.stderr:
-                print(f"  ⚠️ SSH error: {result.stderr[:100]}")
-            return False
-            
-    except subprocess.TimeoutExpired:
-        print(f"  ⚠️ SSH timeout - Pi not responding")
-        return False
-    except FileNotFoundError:
-        print(f"  ⚠️ sshpass not installed!")
-        print(f"     Install it: sudo apt install sshpass (Linux) or brew install sshpass (Mac)")
-        print(f"     Or download for Windows from: https://sourceforge.net/projects/sshpass/")
-        return False
-    except Exception as e:
-        print(f"  ⚠️ SSH error: {e}")
-        return False
-
-def set_path_on_pi(path_num):
-    """Send path setting command to Pi via SSH"""
-    if not USE_SSH:
-        print(f"  🔧 MANUAL: Set Pi switches to Path {path_num}")
-        return True
-    
-    # Call the pi_switch_controller.py script on the Pi
-    command = f'cd /home/{PI_USER}/pulmo_ai_app && python3 pi_switch_controller.py {path_num}'
-    
-    print(f"  🤖 Setting Pi to Path {path_num}...")
-    success = send_to_pi_ssh(command)
-    
-    if success:
-        print(f"    ✅ Path {path_num} set")
-    else:
-        print(f"    ⚠️ Could not set path, check Pi connection")
-    
-    time.sleep(0.5)  # Allow switches to settle
-    return success
-
-def test_pi_connection():
-    """Test if Pi is reachable via SSH"""
-    if not USE_SSH:
-        return True
-    
-    print("\n🔌 Testing Pi connection...")
-    
-    try:
-        # Simple test command
-        command = f'echo "Connected"'
-        result = subprocess.run(
-            f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        if result.returncode == 0 and 'Connected' in result.stdout:
-            print(f"✅ Pi connected at {PI_IP}")
-            return True
-        else:
-            print(f"❌ Cannot connect to Pi at {PI_IP}")
-            print("   Check: Pi is on, connected to network, SSH enabled")
-            if result.stderr:
-                print(f"   Error: {result.stderr[:100]}")
-            return False
-            
-    except FileNotFoundError:
-        print(f"❌ sshpass not installed!")
-        print("   Install it:")
-        print("     Linux: sudo apt install sshpass")
-        print("     Mac: brew install hudochenkov/sshpass/sshpass")
-        print("     Windows: Download from https://sourceforge.net/projects/sshpass/")
-        return False
-    except Exception as e:
-        print(f"❌ Cannot connect to Pi: {e}")
-        return False
-
-def test_pi_switch_script():
-    """Test the pi_switch_controller.py script on Pi"""
-    if not USE_SSH:
-        return True
-    
-    print("\n🔌 Testing Pi switch controller...")
-    
-    # Test the script exists and works
-    command = f'cd /home/{PI_USER}/pulmo_ai_app && python3 pi_switch_controller.py --test'
-    result = subprocess.run(
-        f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
-        shell=True,
-        capture_output=True,
-        text=True,
-        timeout=15
-    )
-    
-    if result.returncode == 0:
-        print(f"✅ Pi switch controller working!")
-        return True
-    else:
-        print(f"❌ Pi switch controller failed")
-        print(f"   Make sure pi_switch_controller.py is in /home/{PI_USER}/pulmo_ai_app/")
-        print(f"   Error: {result.stderr[:100]}")
-        return False
+# Path configurations (for display only)
+PATHS = [
+    {'num': 1, 'name': '1→3', 'description': 'Antenna 1 → Antenna 3'},
+    {'num': 2, 'name': '1→4', 'description': 'Antenna 1 → Antenna 4'},
+    {'num': 3, 'name': '2→3', 'description': 'Antenna 2 → Antenna 3'},
+    {'num': 4, 'name': '2→4', 'description': 'Antenna 2 → Antenna 4'},
+]
 
 def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
     """Capture S21 data for a single antenna path with metadata"""
@@ -228,21 +110,18 @@ def print_header(text):
     print("="*70)
 
 def main():
-    global USE_SSH
-    
-    print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL")
+    print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL (MANUAL MODE)")
     
     print("\n📋 CONFIGURATION:")
     print(f"   VNA Port: {VNA_PORT}")
     print(f"   Frequency: {START_FREQ/1e9:.1f} - {STOP_FREQ/1e9:.1f} GHz")
     print(f"   Points: {POINTS}")
     print(f"   Scans per condition: {SCANS_PER_CONDITION}")
-    print(f"   Pi Control: {'SSH' if USE_SSH else 'Manual'}")
-    if USE_SSH:
-        print(f"   Pi IP: {PI_IP}")
-        print(f"   Pi User: {PI_USER}")
+    print(f"\n🤖 CONTROL MODE: Manual")
+    print("   You'll set paths on Pi when prompted")
+    print("   Make sure pi_switch_controller.py is running on Pi")
     
-    # Test VNA connection first
+    # Test VNA connection
     print("\n🔌 Checking VNA connection...")
     try:
         with serial.Serial(VNA_PORT, BAUDRATE, timeout=2) as test_ser:
@@ -257,23 +136,6 @@ def main():
         print(f"❌ Cannot connect to VNA on {VNA_PORT}: {e}")
         print("   Check: VNA powered on, USB connected, correct port")
         return
-    
-    # Test Pi connection if using SSH
-    if USE_SSH:
-        if not test_pi_connection():
-            response = input("\nContinue in manual mode? (y/n): ")
-            if response.lower() != 'y':
-                return
-            USE_SSH = False
-            print("\n⚠️  Switching to manual mode")
-        else:
-            # Test the switch script
-            if not test_pi_switch_script():
-                response = input("\nSwitch controller failed. Continue in manual mode? (y/n): ")
-                if response.lower() != 'y':
-                    return
-                USE_SSH = False
-                print("\n⚠️  Switching to manual mode")
     
     # Test conditions
     CONDITIONS = [
@@ -314,8 +176,7 @@ def main():
         'num_points': POINTS,
         'scans_per_condition': SCANS_PER_CONDITION,
         'rotations': ROTATIONS if ROTATION_ENABLED else [0],
-        'use_ssh': USE_SSH,
-        'pi_ip': PI_IP if USE_SSH else None,
+        'mode': 'manual',
         'conditions': []
     }
     
@@ -343,25 +204,19 @@ def main():
             for run_num in range(1, SCANS_PER_CONDITION + 1):
                 print(f"\n  📸 Rotation: {rotation}°, Run: {run_num}/{SCANS_PER_CONDITION}")
                 
-                # Scan all 4 paths
-                for path_num in range(1, 5):
-                    path_names = {1: '1→3', 2: '1→4', 3: '2→3', 4: '2→4'}
-                    path_name = path_names[path_num]
+                # Scan all 4 paths for this rotation/run
+                for path in PATHS:
                     total_scans += 1
                     
-                    # Set path on Pi via SSH
-                    if USE_SSH:
-                        if not set_path_on_pi(path_num):
-                            print(f"    ⚠️ Failed to set path, skipping...")
-                            continue
-                    else:
-                        print(f"    🔧 MANUAL: Set Pi switches to Path {path_num} ({path_name})")
-                        input("      Press ENTER after setting switches...")
+                    # Prompt user to set path on Pi
+                    print(f"\n    🔧 Set Pi to Path {path['num']}: {path['description']}")
+                    print(f"       On Pi terminal, type: {path['num']}")
+                    input("       Press ENTER after setting path on Pi...")
                     
                     # Capture data
                     success, stats = capture_path(
-                        path_num, 
-                        path_name,
+                        path['num'], 
+                        path['name'],
                         rotation=rotation,
                         run_num=run_num,
                         condition_name=cond_folder
@@ -373,8 +228,8 @@ def main():
                         print(f"    ⚠️ Failed, retrying...")
                         time.sleep(2)
                         success, stats = capture_path(
-                            path_num, 
-                            path_name,
+                            path['num'], 
+                            path['name'],
                             rotation=rotation,
                             run_num=run_num,
                             condition_name=cond_folder
@@ -383,6 +238,7 @@ def main():
                             successful_scans += 1
                 
                 # Small pause between runs
+                print(f"\n  ✅ Run {run_num} complete!")
                 time.sleep(1)
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
