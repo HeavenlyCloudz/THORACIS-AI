@@ -1,68 +1,111 @@
 # full_phantom_scan.py
 """
-COMPLETE PHANTOM SCANNING PROTOCOL with Pi Switch Control
-Running this script on COMPUTER (controls VNA)
-Pi runs pi_switch_controller.py in background
+COMPLETE PHANTOM SCANNING PROTOCOL with Pi SSH Control
+Script run on COMPUTER (controls VNA)
+Pi controls switches via SSH commands
 """
 import serial
 import time
 import csv
 import math
 import os
-import socket
 import subprocess
 from datetime import datetime
 import numpy as np
+from pathlib import Path
 
 # CONFIGURATION
-VNA_PORT = 'COM4'  # Change to your VNA port
+VNA_PORT = 'COM4'  
 BAUDRATE = 115200
 START_FREQ = 2000000000  # 2.0 GHz
 STOP_FREQ = 3000000000   # 3.0 GHz
 POINTS = 201
 
-# PI CONFIGURATION
+# PI SSH CONFIGURATION
 PI_IP = '192.168.1.201'  # Replace with your Pi's IP address
-USE_PI_CONTROL = True     # Set to False if controlling switches manually
+PI_USER = 'havil'           # Usually 'pi' for Raspberry Pi
+PI_PASSWORD = '510270516'  # Only needed if no SSH keys set up
+USE_SSH = True            # Set to True for SSH control, False for manual
 
 # SCAN CONFIGURATION
 SCANS_PER_CONDITION = 3   # Number of repeat scans
 ROTATIONS = [0, 120, 240] # Rotation angles (degrees)
-ROTATION_ENABLED = True
+ROTATION_ENABLED = False   # Set to True if you have rotation capability
 
-# Path configurations (same as pi_switch_controller)
+# Path configurations
 PATHS = [
-    {'num': 1, 'name': '1→3', 'gpio': {'17': 1, '27': 0, '18': 1, '22': 0}},
-    {'num': 2, 'name': '1→4', 'gpio': {'17': 1, '27': 0, '18': 0, '22': 1}},
-    {'num': 3, 'name': '2→3', 'gpio': {'17': 0, '27': 1, '18': 1, '22': 0}},
-    {'num': 4, 'name': '2→4', 'gpio': {'17': 0, '27': 1, '18': 0, '22': 1}}
+    {'num': 1, 'name': '1→3', 'gpio_cmd': 'echo "path 1" > /tmp/switch_cmd'},
+    {'num': 2, 'name': '1→4', 'gpio_cmd': 'echo "path 2" > /tmp/switch_cmd'},
+    {'num': 3, 'name': '2→3', 'gpio_cmd': 'echo "path 3" > /tmp/switch_cmd'},
+    {'num': 4, 'name': '2→4', 'gpio_cmd': 'echo "path 4" > /tmp/switch_cmd'},
 ]
 
-def send_to_pi(command):
-    """Send command to Pi via network (optional)"""
-    if not USE_PI_CONTROL:
-        return False
-    try:
-        # Option 1: SSH command (if SSH keys set up)
-        # subprocess.run(f'ssh pi@{PI_IP} "{command}"', shell=True, capture_output=True)
-        
-        # Option 2: Simple TCP socket (create a server on Pi)
-        # For now, we'll just print instructions
-        print(f"  [PI COMMAND] {command}")
+def send_to_pi_ssh(command):
+    """Send command to Pi via SSH"""
+    if not USE_SSH:
+        print(f"  [MANUAL] {command}")
         return True
-    except:
+    
+    try:
+        # Option 1: If you have SSH keys set up (recommended)
+        result = subprocess.run(
+            f'ssh {PI_USER}@{PI_IP} "{command}"',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        
+        # Option 2: If you need password (less secure, but works)
+        # result = subprocess.run(
+        #     f'sshpass -p "{PI_PASSWORD}" ssh {PI_USER}@{PI_IP} "{command}"',
+        #     shell=True,
+        #     capture_output=True,
+        #     text=True,
+        #     timeout=5
+        # )
+        
+        if result.returncode == 0:
+            return True
+        else:
+            print(f"  ⚠️ SSH error: {result.stderr}")
+            return False
+            
+    except subprocess.TimeoutExpired:
+        print(f"  ⚠️ SSH timeout - Pi not responding")
+        return False
+    except Exception as e:
+        print(f"  ⚠️ SSH error: {e}")
         return False
 
 def set_path_on_pi(path_num):
-    """Send path setting command to Pi"""
-    if USE_PI_CONTROL:
-        print(f"  Sending path {path_num} to Pi...")
-        # Send via SSH or socket
-        # subprocess.run(f'ssh pi@{PI_IP} "python3 -c \'import pi_switch; pi_switch.set_path({path_num})\'"', shell=True)
+    """Send path setting command to Pi via SSH"""
+    if not USE_SSH:
+        print(f"  🔧 MANUAL: Set Pi switches to Path {path_num}")
         return True
+    
+    # Method 1: Direct GPIO control via Python on Pi
+    command = f'python3 -c "import RPi.GPIO as GPIO; GPIO.setmode(GPIO.BCM); ' \
+              f'pins = [17,27,18,22]; [GPIO.setup(p, GPIO.OUT) for p in pins]; ' \
+              f'vals = {PATHS[path_num-1]["gpio_vals"]}; ' \
+              f'GPIO.output(17, vals[0]); GPIO.output(27, vals[1]); ' \
+              f'GPIO.output(18, vals[2]); GPIO.output(22, vals[3]); ' \
+              f'print(f\"Path {path_num} set\")"'
+    
+    # Method 2: If you have a switch controller script running
+    # command = f'echo "path {path_num}" | nc localhost 8888'  # Using netcat
+    # command = f'python3 /home/pi/pi_switch_controller.py --path {path_num}'
+    
+    print(f"  🤖 Setting Pi to Path {path_num}...")
+    success = send_to_pi_ssh(command)
+    
+    if success:
+        print(f"    ✅ Path {path_num} set")
     else:
-        print(f"  MANUAL: Set Pi switches to Path {path_num}")
-        return False
+        print(f"    ⚠️ Could not set path, check Pi connection")
+    
+    time.sleep(0.5)  # Allow switches to settle
+    return success
 
 def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
     """Capture S21 data for a single antenna path with metadata"""
@@ -75,7 +118,7 @@ def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
     os.makedirs(condition_name, exist_ok=True)
     full_path = os.path.join(condition_name, filename)
     
-    print(f"\n  📡 Capturing {path_name}...", end='', flush=True)
+    print(f"  📡 Capturing {path_name}...", end='', flush=True)
     
     try:
         with serial.Serial(VNA_PORT, BAUDRATE, timeout=2) as ser:
@@ -140,6 +183,31 @@ def print_header(text):
     print(f" {text}")
     print("="*70)
 
+def test_pi_connection():
+    """Test if Pi is reachable via SSH"""
+    if not USE_SSH:
+        return True
+    
+    print("\n🔌 Testing Pi connection...")
+    try:
+        result = subprocess.run(
+            f'ssh {PI_USER}@{PI_IP} "echo Connected"',
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            print(f"✅ Pi connected at {PI_IP}")
+            return True
+        else:
+            print(f"❌ Cannot connect to Pi at {PI_IP}")
+            print("   Check: Pi is on, connected to network, SSH enabled")
+            return False
+    except Exception as e:
+        print(f"❌ Cannot connect to Pi: {e}")
+        return False
+
 def main():
     print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL")
     
@@ -159,14 +227,26 @@ def main():
         print("   Check: VNA powered on, USB connected, correct port")
         return
     
-    # Pi control instructions
-    if USE_PI_CONTROL:
-        print("\n🤖 Pi Control Mode: ENABLED")
-        print("   Make sure pi_switch_controller.py is running on Pi")
-        print("   Pi should be ready to receive path commands")
-    else:
-        print("\n🔧 Manual Switch Mode")
-        print("   You'll set switches manually when prompted")
+    # Test Pi connection if using SSH
+    if USE_SSH:
+        if not test_pi_connection():
+            response = input("\nContinue in manual mode? (y/n): ")
+            if response.lower() != 'y':
+                return
+            global USE_SSH
+            USE_SSH = False
+    
+    # Set up GPIO pin mappings for SSH control
+    for i, path in enumerate(PATHS):
+        # Define GPIO values for each path
+        if path['num'] == 1:  # Path 1: 1→3
+            path['gpio_vals'] = [1, 0, 1, 0]  # [17,27,18,22]
+        elif path['num'] == 2:  # Path 2: 1→4
+            path['gpio_vals'] = [1, 0, 0, 1]
+        elif path['num'] == 3:  # Path 3: 2→3
+            path['gpio_vals'] = [0, 1, 1, 0]
+        elif path['num'] == 4:  # Path 4: 2→4
+            path['gpio_vals'] = [0, 1, 0, 1]
     
     # Test conditions
     CONDITIONS = [
@@ -207,7 +287,8 @@ def main():
         'num_points': POINTS,
         'scans_per_condition': SCANS_PER_CONDITION,
         'rotations': ROTATIONS if ROTATION_ENABLED else [0],
-        'use_pi_control': USE_PI_CONTROL,
+        'use_ssh': USE_SSH,
+        'pi_ip': PI_IP if USE_SSH else None,
         'conditions': []
     }
     
@@ -232,17 +313,11 @@ def main():
                 print(f"\n  📸 Rotation: {rotation}°, Run: {run_num}/{SCANS_PER_CONDITION}")
                 
                 # Scan all 4 paths for this rotation/run
-                for path_idx, path in enumerate(PATHS, 1):
-                    # Send path to Pi
-                    if USE_PI_CONTROL:
-                        print(f"    Setting Pi to Path {path['num']}...")
-                        # In a real setup, you'd send actual command here
-                        # For now, we print the instruction
-                    else:
-                        print(f"    MANUAL: Set switches to Path {path['num']} ({path['name']})")
-                    
-                    # Wait for Pi to set path (adjust timing as needed)
-                    time.sleep(0.5)
+                for path in PATHS:
+                    # Set path on Pi via SSH
+                    if not set_path_on_pi(path['num']):
+                        print(f"    ⚠️ Failed to set path, skipping...")
+                        continue
                     
                     # Capture data
                     success, stats = capture_path(
@@ -254,7 +329,7 @@ def main():
                     )
                     
                     if not success:
-                        print(f"    ⚠️  Failed, retrying...")
+                        print(f"    ⚠️ Failed, retrying...")
                         time.sleep(2)
                         success, stats = capture_path(
                             path['num'], 
@@ -292,15 +367,13 @@ def main():
     
     print_header("SCANNING COMPLETE!")
     print(f"📁 All data saved in: {base_folder}")
-    print(f"📊 Total scans: {len([f for f in Path(base_folder).rglob('*.csv')])}")
+    
+    # Count total files
+    total_files = len([f for f in Path(base_folder).rglob('*.csv')])
+    print(f"📊 Total scans: {total_files}")
     
     print("\n🔍 NEXT STEP: Run analysis script")
     print(f"python analyze_phantom_data.py {base_folder}")
-    print("\n🤖 For automated scanning with Pi:")
-    print("   1. On Pi, run: python pi_switch_controller.py")
-    print("   2. Then run this script with USE_PI_CONTROL = True")
-    print("   3. Ensure Pi and computer are on same network")
 
 if __name__ == "__main__":
-    from pathlib import Path
     main()
