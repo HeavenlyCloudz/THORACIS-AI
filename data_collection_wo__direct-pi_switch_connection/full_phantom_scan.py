@@ -2,7 +2,7 @@
 """
 COMPLETE PHANTOM SCANNING PROTOCOL
 Script runs on COMPUTER (controls VNA)
-Pi controls switches via SSH commands
+Pi controls switches via SSH commands with password authentication
 """
 import serial
 import time
@@ -47,48 +47,67 @@ def send_to_pi_ssh(command):
         return True
     
     try:
-        # Method 1: Using sshpass (recommended - install with: sudo apt install sshpass)
-        # Uncomment this if you have sshpass installed
-        """
-        result = subprocess.run(
-            f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        """
-        
-        # Method 2: Using expect (built-in on most systems)
-        # Create a temporary expect script
-        expect_script = f'''#!/usr/bin/expect -f
-set timeout 5
+        # Using sshpass (install on your computer: pip install sshpass or apt install sshpass)
+        # Check if sshpass is available
+        try:
+            subprocess.run(['sshpass', '-V'], capture_output=True, check=False)
+            # sshpass is available - use it
+            result = subprocess.run(
+                f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                return True
+            else:
+                print(f"  ⚠️ SSH error: {result.stderr}")
+                return False
+        except:
+            # sshpass not available, try using plink (Windows) or expect
+            if os.name == 'nt':  # Windows
+                # Use plink (PuTTY command line)
+                result = subprocess.run(
+                    f'plink -ssh -pw {PI_PASSWORD} {PI_USER}@{PI_IP} "{command}"',
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            else:  # Linux/Mac
+                # Use ssh with expect (fallback)
+                expect_script = f'''#!/usr/bin/expect -f
+set timeout 10
 spawn ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"
 expect "password:"
 send "{PI_PASSWORD}\\r"
 expect eof
 '''
-        # Save expect script to temp file
-        with open('/tmp/ssh_expect.exp', 'w') as f:
-            f.write(expect_script)
-        os.chmod('/tmp/ssh_expect.exp', 0o755)
-        
-        # Run expect script
-        result = subprocess.run(
-            '/tmp/ssh_expect.exp',
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        # Clean up
-        os.remove('/tmp/ssh_expect.exp')
-        
-        if result.returncode == 0:
-            return True
-        else:
-            print(f"  ⚠️ SSH error: {result.stderr}")
-            return False
+                # Save expect script to temp file
+                with open('/tmp/ssh_expect.exp', 'w') as f:
+                    f.write(expect_script)
+                os.chmod('/tmp/ssh_expect.exp', 0o755)
+                
+                # Run expect script
+                result = subprocess.run(
+                    '/tmp/ssh_expect.exp',
+                    capture_output=True,
+                    text=True,
+                    timeout=15
+                )
+                
+                # Clean up
+                try:
+                    os.remove('/tmp/ssh_expect.exp')
+                except:
+                    pass
+            
+            if result.returncode == 0:
+                return True
+            else:
+                print(f"  ⚠️ SSH error: {result.stderr}")
+                return False
             
     except subprocess.TimeoutExpired:
         print(f"  ⚠️ SSH timeout - Pi not responding")
@@ -111,7 +130,6 @@ def set_path_on_pi(path_num):
     # This runs directly on Pi via SSH
     command = f'''python3 -c "
 import RPi.GPIO as GPIO
-import sys
 GPIO.setmode(GPIO.BCM)
 pins = [17, 27, 18, 22]
 for pin in pins:
@@ -146,35 +164,58 @@ def test_pi_connection():
         # Simple test command
         command = 'echo "Connected"'
         
-        # Create expect script for test
-        expect_script = f'''#!/usr/bin/expect -f
-set timeout 5
+        # Try sshpass first (fastest)
+        try:
+            subprocess.run(['sshpass', '-V'], capture_output=True, check=False)
+            result = subprocess.run(
+                f'sshpass -p "{PI_PASSWORD}" ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"',
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0 and 'Connected' in result.stdout:
+                print(f"✅ Pi connected at {PI_IP}")
+                return True
+        except:
+            pass
+        
+        # Fallback to expect (slower but works)
+        if os.name != 'nt':  # Not Windows
+            expect_script = f'''#!/usr/bin/expect -f
+set timeout 10
 spawn ssh -o StrictHostKeyChecking=no {PI_USER}@{PI_IP} "{command}"
 expect "password:"
 send "{PI_PASSWORD}\\r"
 expect eof
 '''
-        with open('/tmp/ssh_test.exp', 'w') as f:
-            f.write(expect_script)
-        os.chmod('/tmp/ssh_test.exp', 0o755)
+            with open('/tmp/ssh_test.exp', 'w') as f:
+                f.write(expect_script)
+            os.chmod('/tmp/ssh_test.exp', 0o755)
+            
+            result = subprocess.run(
+                '/tmp/ssh_test.exp',
+                capture_output=True,
+                text=True,
+                timeout=15
+            )
+            
+            try:
+                os.remove('/tmp/ssh_test.exp')
+            except:
+                pass
+            
+            if result.returncode == 0 and 'Connected' in result.stdout:
+                print(f"✅ Pi connected at {PI_IP}")
+                return True
         
-        result = subprocess.run(
-            '/tmp/ssh_test.exp',
-            capture_output=True,
-            text=True,
-            timeout=10
-        )
-        
-        os.remove('/tmp/ssh_test.exp')
-        
-        if result.returncode == 0 and 'Connected' in result.stdout:
-            print(f"✅ Pi connected at {PI_IP}")
-            return True
-        else:
-            print(f"❌ Cannot connect to Pi at {PI_IP}")
-            print("   Check: Pi is on, connected to network, SSH enabled")
-            print(f"   Error: {result.stderr}")
-            return False
+        print(f"❌ Cannot connect to Pi at {PI_IP}")
+        print("   Check: Pi is on, connected to network, SSH enabled")
+        print("   Alternative: Install sshpass on your computer")
+        print("     Windows: Download from https://sourceforge.net/projects/sshpass/")
+        print("     Mac: brew install hudochenkov/sshpass/sshpass")
+        print("     Linux: sudo apt install sshpass")
+        return False
             
     except Exception as e:
         print(f"❌ Cannot connect to Pi: {e}")
@@ -201,7 +242,7 @@ def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
             # Send scan command (5 = freq + S21 data in dB format)
             cmd = f"scan {START_FREQ} {STOP_FREQ} {POINTS} 5"
             ser.write((cmd + '\n').encode())
-            time.sleep(1.5)  # Wait for sweep (increased for reliability)
+            time.sleep(1.5)  # Wait for sweep
             
             # Collect data
             data_points = []
@@ -257,6 +298,9 @@ def print_header(text):
     print("="*70)
 
 def main():
+    # Global variable for SSH mode - must be declared before use
+    global USE_SSH
+    
     print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL")
     
     print("\n📋 CONFIGURATION:")
@@ -292,8 +336,8 @@ def main():
             response = input("\nContinue in manual mode? (y/n): ")
             if response.lower() != 'y':
                 return
-            global USE_SSH
-            USE_SSH = False
+            USE_SSH = False  # This is allowed now because it's declared global in main()
+            print("\n⚠️  Switching to manual mode")
     
     # Test conditions
     CONDITIONS = [
