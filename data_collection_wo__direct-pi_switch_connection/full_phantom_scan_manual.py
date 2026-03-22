@@ -3,6 +3,7 @@
 COMPLETE PHANTOM SCANNING PROTOCOL - MANUAL MODE
 Run this on your COMPUTER
 You'll manually set paths on Pi when prompted
+Now with 1 scan per rotation (faster!)
 """
 import serial
 import time
@@ -21,7 +22,7 @@ STOP_FREQ = 3000000000   # 3.0 GHz
 POINTS = 201
 
 # SCAN CONFIGURATION
-SCANS_PER_CONDITION = 3   # Number of repeat scans
+SCANS_PER_CONDITION = 1   # Changed from 3 to 1 - much faster!
 ROTATIONS = [0, 120, 240] # Rotation angles (degrees)
 ROTATION_ENABLED = True   # Set to True if you have rotation capability
 
@@ -33,12 +34,12 @@ PATHS = [
     {'num': 4, 'name': '2→4', 'description': 'Antenna 2 → Antenna 4'},
 ]
 
-def capture_path(path_num, path_name, rotation=0, run_num=1, condition_name=""):
+def capture_path(path_num, path_name, rotation=0, condition_name=""):
     """Capture S21 data for a single antenna path with metadata"""
     
-    # Create filename with metadata
+    # Create filename with metadata (removed run_num)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"path{path_num}_rot{rotation}_run{run_num}_{timestamp}.csv"
+    filename = f"path{path_num}_rot{rotation}_{timestamp}.csv"
     
     # Ensure folder exists
     os.makedirs(condition_name, exist_ok=True)
@@ -116,7 +117,11 @@ def main():
     print(f"   VNA Port: {VNA_PORT}")
     print(f"   Frequency: {START_FREQ/1e9:.1f} - {STOP_FREQ/1e9:.1f} GHz")
     print(f"   Points: {POINTS}")
-    print(f"   Scans per condition: {SCANS_PER_CONDITION}")
+    print(f"   Scans per rotation: 1 (fast mode!)")
+    if ROTATION_ENABLED:
+        print(f"   Rotations: {ROTATIONS} degrees")
+    else:
+        print(f"   Rotations: None (single position)")
     print(f"\n🤖 CONTROL MODE: Manual")
     print("   You'll set paths on Pi when prompted")
     print("   Make sure pi_switch_controller.py is running on Pi")
@@ -174,7 +179,7 @@ def main():
         'freq_start_ghz': START_FREQ/1e9,
         'freq_stop_ghz': STOP_FREQ/1e9,
         'num_points': POINTS,
-        'scans_per_condition': SCANS_PER_CONDITION,
+        'scans_per_condition': 1,  # Updated
         'rotations': ROTATIONS if ROTATION_ENABLED else [0],
         'mode': 'manual',
         'conditions': []
@@ -199,47 +204,43 @@ def main():
         total_scans = 0
         successful_scans = 0
         
-        # Scan with rotations and multiple runs
+        # Scan with rotations (no multiple runs - just 1 each!)
         for rotation in rotations_to_use:
-            for run_num in range(1, SCANS_PER_CONDITION + 1):
-                print(f"\n  📸 Rotation: {rotation}°, Run: {run_num}/{SCANS_PER_CONDITION}")
+            print(f"\n  📸 Rotation: {rotation}°")
+            
+            # Scan all 4 paths for this rotation
+            for path in PATHS:
+                total_scans += 1
                 
-                # Scan all 4 paths for this rotation/run
-                for path in PATHS:
-                    total_scans += 1
-                    
-                    # Prompt user to set path on Pi
-                    print(f"\n    🔧 Set Pi to Path {path['num']}: {path['description']}")
-                    print(f"       On Pi terminal, type: {path['num']}")
-                    input("       Press ENTER after setting path on Pi...")
-                    
-                    # Capture data
+                # Prompt user to set path on Pi
+                print(f"\n    🔧 Set Pi to Path {path['num']}: {path['description']}")
+                print(f"       On Pi terminal, type: {path['num']}")
+                input("       Press ENTER after setting path on Pi...")
+                
+                # Capture data
+                success, stats = capture_path(
+                    path['num'], 
+                    path['name'],
+                    rotation=rotation,
+                    condition_name=cond_folder
+                )
+                
+                if success:
+                    successful_scans += 1
+                else:
+                    print(f"    ⚠️ Failed, retrying...")
+                    time.sleep(2)
                     success, stats = capture_path(
                         path['num'], 
                         path['name'],
                         rotation=rotation,
-                        run_num=run_num,
                         condition_name=cond_folder
                     )
-                    
                     if success:
                         successful_scans += 1
-                    else:
-                        print(f"    ⚠️ Failed, retrying...")
-                        time.sleep(2)
-                        success, stats = capture_path(
-                            path['num'], 
-                            path['name'],
-                            rotation=rotation,
-                            run_num=run_num,
-                            condition_name=cond_folder
-                        )
-                        if success:
-                            successful_scans += 1
-                
-                # Small pause between runs
-                print(f"\n  ✅ Run {run_num} complete!")
-                time.sleep(1)
+            
+            print(f"\n  ✅ Rotation {rotation}° complete!")
+            time.sleep(0.5)  # Small pause between rotations
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
         print(f"   Successful scans: {successful_scans}/{total_scans}")
@@ -251,7 +252,7 @@ def main():
             'planned_scans': total_scans,
             'successful_scans': successful_scans,
             'rotations': rotations_to_use,
-            'runs': SCANS_PER_CONDITION
+            'runs': 1  # Updated to 1
         })
         
         # Ask if user wants to continue
@@ -272,6 +273,13 @@ def main():
     # Count total files
     total_files = len([f for f in Path(base_folder).rglob('*.csv')])
     print(f"📊 Total CSV files: {total_files}")
+    
+    # Calculate time savings
+    old_total = 4 * 3 * 4  # 4 paths × 3 rotations × 4 conditions = 48 scans
+    new_total = total_files
+    print(f"\n⏱️  Time savings: {old_total} scans would have taken ~{old_total*10/60:.0f} minutes")
+    print(f"              Now: {new_total} scans takes ~{new_total*10/60:.0f} minutes")
+    print(f"              Saved: {(old_total - new_total)*10/60:.0f} minutes!")
     
     print("\n🔍 NEXT STEP: Run analysis script")
     print(f"python analyze_phantom_data.py {base_folder}")
