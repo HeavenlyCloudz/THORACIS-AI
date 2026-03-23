@@ -1,4 +1,4 @@
-# full_phantom_scan_manual.py
+# complete_full_phantom_scan_manual.py
 """
 COMPLETE PHANTOM SCANNING PROTOCOL - MANUAL MODE (FAST VERSION)
 Run this on your COMPUTER
