@@ -1,9 +1,8 @@
 # full_phantom_scan_manual.py
 """
-COMPLETE PHANTOM SCANNING PROTOCOL - MANUAL MODE
+COMPLETE PHANTOM SCANNING PROTOCOL - MANUAL MODE (FAST VERSION)
 Run this on your COMPUTER
 You'll manually set paths on Pi when prompted
-Now with 1 scan per rotation (faster!)
 """
 import serial
 import time
@@ -22,9 +21,9 @@ STOP_FREQ = 3000000000   # 3.0 GHz
 POINTS = 201
 
 # SCAN CONFIGURATION
-SCANS_PER_CONDITION = 1   # Changed from 3 to 1 - much faster!
-ROTATIONS = [0, 120, 240] # Rotation angles (degrees)
-ROTATION_ENABLED = True   # Set to True if you have rotation capability
+SCANS_PER_CONDITION = 1   # Just 1 scan per condition (fast!)
+ROTATIONS = [0]           # Just 0° rotation (no rotation, keep it simple)
+ROTATION_ENABLED = False   # Disable rotation for faster scanning
 
 # Path configurations (for display only)
 PATHS = [
@@ -34,12 +33,12 @@ PATHS = [
     {'num': 4, 'name': '2→4', 'description': 'Antenna 2 → Antenna 4'},
 ]
 
-def capture_path(path_num, path_name, rotation=0, condition_name=""):
-    """Capture S21 data for a single antenna path with metadata"""
+def capture_path(path_num, path_name, condition_name="", scan_num=1):
+    """Capture S21 data for a single antenna path"""
     
-    # Create filename with metadata (removed run_num)
+    # Create filename with metadata
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"path{path_num}_rot{rotation}_{timestamp}.csv"
+    filename = f"path{path_num}_{timestamp}.csv"
     
     # Ensure folder exists
     os.makedirs(condition_name, exist_ok=True)
@@ -111,17 +110,13 @@ def print_header(text):
     print("="*70)
 
 def main():
-    print_header("PULMO AI - COMPLETE PHANTOM SCANNING PROTOCOL (MANUAL MODE)")
+    print_header("PULMO AI - FAST PHANTOM SCANNING (MANUAL MODE)")
     
     print("\n📋 CONFIGURATION:")
     print(f"   VNA Port: {VNA_PORT}")
     print(f"   Frequency: {START_FREQ/1e9:.1f} - {STOP_FREQ/1e9:.1f} GHz")
     print(f"   Points: {POINTS}")
-    print(f"   Scans per rotation: 1 (fast mode!)")
-    if ROTATION_ENABLED:
-        print(f"   Rotations: {ROTATIONS} degrees")
-    else:
-        print(f"   Rotations: None (single position)")
+    print(f"   Scans: 1 per condition (fast!)")
     print(f"\n🤖 CONTROL MODE: Manual")
     print("   You'll set paths on Pi when prompted")
     print("   Make sure pi_switch_controller.py is running on Pi")
@@ -142,7 +137,7 @@ def main():
         print("   Check: VNA powered on, USB connected, correct port")
         return
     
-    # Test conditions
+    # Test conditions - ONLY 3 CONDITIONS (Baseline, Healthy, Tumor)
     CONDITIONS = [
         {
             'name': '01_baseline_air',
@@ -150,18 +145,13 @@ def main():
             'prompt': 'Remove ALL phantoms'
         },
         {
-            'name': '02_healthy_phantom_1',
-            'description': 'HEALTHY PHANTOM #1 - First agar phantom',
-            'prompt': 'Place HEALTHY phantom #1 between antennas'
+            'name': '02_healthy_phantom',
+            'description': 'HEALTHY PHANTOM - Agar phantom (no tumor)',
+            'prompt': 'Place HEALTHY phantom between antennas'
         },
         {
-            'name': '03_healthy_phantom_2',
-            'description': 'HEALTHY PHANTOM #2 - Second agar phantom',
-            'prompt': 'Place HEALTHY phantom #2 between antennas'
-        },
-        {
-            'name': '04_tumor_phantom',
-            'description': 'TUMOR PHANTOM - With embedded tumor simulant',
+            'name': '03_tumor_phantom',
+            'description': 'TUMOR PHANTOM - Healthy phantom WITH embedded tumor simulant',
             'prompt': 'Place TUMOR phantom between antennas'
         }
     ]
@@ -179,8 +169,7 @@ def main():
         'freq_start_ghz': START_FREQ/1e9,
         'freq_stop_ghz': STOP_FREQ/1e9,
         'num_points': POINTS,
-        'scans_per_condition': 1,  # Updated
-        'rotations': ROTATIONS if ROTATION_ENABLED else [0],
+        'scans_per_condition': 1,
         'mode': 'manual',
         'conditions': []
     }
@@ -197,50 +186,44 @@ def main():
         
         input("\nPress ENTER when ready to start this condition...")
         
-        # Get rotations to use
-        rotations_to_use = ROTATIONS if ROTATION_ENABLED else [0]
-        
         # Track successful scans
         total_scans = 0
         successful_scans = 0
         
-        # Scan with rotations (no multiple runs - just 1 each!)
-        for rotation in rotations_to_use:
-            print(f"\n  📸 Rotation: {rotation}°")
+        print(f"\n  📸 Starting scan for {condition['name']}...")
+        
+        # Scan all 4 paths
+        for path in PATHS:
+            total_scans += 1
             
-            # Scan all 4 paths for this rotation
-            for path in PATHS:
-                total_scans += 1
-                
-                # Prompt user to set path on Pi
-                print(f"\n    🔧 Set Pi to Path {path['num']}: {path['description']}")
-                print(f"       On Pi terminal, type: {path['num']}")
-                input("       Press ENTER after setting path on Pi...")
-                
-                # Capture data
+            # Prompt user to set path on Pi
+            print(f"\n    🔧 Set Pi to Path {path['num']}: {path['description']}")
+            print(f"       On Pi terminal, type: {path['num']}")
+            input("       Press ENTER after setting path on Pi...")
+            
+            # Capture data
+            success, stats = capture_path(
+                path['num'], 
+                path['name'],
+                condition_name=cond_folder,
+                scan_num=1
+            )
+            
+            if success:
+                successful_scans += 1
+                if stats:
+                    print(f"       📊 S21: avg={stats['avg']:.1f}dB, min={stats['min']:.1f}dB, max={stats['max']:.1f}dB")
+            else:
+                print(f"    ⚠️ Failed, retrying...")
+                time.sleep(2)
                 success, stats = capture_path(
                     path['num'], 
                     path['name'],
-                    rotation=rotation,
-                    condition_name=cond_folder
+                    condition_name=cond_folder,
+                    scan_num=1
                 )
-                
                 if success:
                     successful_scans += 1
-                else:
-                    print(f"    ⚠️ Failed, retrying...")
-                    time.sleep(2)
-                    success, stats = capture_path(
-                        path['num'], 
-                        path['name'],
-                        rotation=rotation,
-                        condition_name=cond_folder
-                    )
-                    if success:
-                        successful_scans += 1
-            
-            print(f"\n  ✅ Rotation {rotation}° complete!")
-            time.sleep(0.5)  # Small pause between rotations
         
         print(f"\n✅ Condition '{condition['name']}' complete!")
         print(f"   Successful scans: {successful_scans}/{total_scans}")
@@ -249,10 +232,8 @@ def main():
         metadata['conditions'].append({
             'name': condition['name'],
             'description': condition['description'],
-            'planned_scans': total_scans,
             'successful_scans': successful_scans,
-            'rotations': rotations_to_use,
-            'runs': 1  # Updated to 1
+            'total_scans': total_scans
         })
         
         # Ask if user wants to continue
@@ -274,15 +255,16 @@ def main():
     total_files = len([f for f in Path(base_folder).rglob('*.csv')])
     print(f"📊 Total CSV files: {total_files}")
     
-    # Calculate time savings
-    old_total = 4 * 3 * 4  # 4 paths × 3 rotations × 4 conditions = 48 scans
-    new_total = total_files
-    print(f"\n⏱️  Time savings: {old_total} scans would have taken ~{old_total*10/60:.0f} minutes")
-    print(f"              Now: {new_total} scans takes ~{new_total*10/60:.0f} minutes")
-    print(f"              Saved: {(old_total - new_total)*10/60:.0f} minutes!")
+    print("\n📊 SCAN SUMMARY:")
+    print(f"   • Baseline (air): 4 files (paths 1-4)")
+    print(f"   • Healthy phantom: 4 files (paths 1-4)")
+    print(f"   • Tumor phantom: 4 files (paths 1-4)")
+    print(f"   • TOTAL: 12 CSV files")
     
     print("\n🔍 NEXT STEP: Run analysis script")
     print(f"python analyze_phantom_data.py {base_folder}")
+    print("\n🔄 Then run ML dataset creation:")
+    print(f"python create_ml_images_updated.py")
 
 if __name__ == "__main__":
     main()
