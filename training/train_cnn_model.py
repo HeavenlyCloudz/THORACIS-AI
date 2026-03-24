@@ -1,6 +1,7 @@
-# train_cnn_model.py - UPDATED for 2 paths
+# train_cnn_model.py - UPDATED with .keras format
 """
-Training CNN on S21 "images" (2 paths × 201 frequencies)
+Training CNN on S21 "images" from PULMO AI
+Saves model as .keras file for Raspberry Pi deployment
 """
 import numpy as np
 import tensorflow as tf
@@ -9,11 +10,13 @@ from tensorflow.keras import layers
 import matplotlib.pyplot as plt
 from pathlib import Path
 import json
+import os
 
 def create_cnn_model(input_shape=(2, 201, 1), num_classes=3):
-    """Create CNN for S21 image classification (2 paths)"""
+    """Create CNN for S21 image classification (2 paths only)"""
     
     model = keras.Sequential([
+        # Input layer
         layers.Input(shape=input_shape),
         
         # First convolutional block
@@ -39,64 +42,16 @@ def create_cnn_model(input_shape=(2, 201, 1), num_classes=3):
         layers.BatchNormalization(),
         layers.Dropout(0.3),
         
+        # Output layer
         layers.Dense(num_classes, activation='softmax')
     ])
     
     return model
 
-def load_dataset(dataset_path):
-    """Load the dataset from your ml_dataset_final folder"""
-    
-    class_names = ['baseline', 'healthy', 'tumor']
-    images = []
-    labels = []
-    
-    # Find all numpy image files
-    cnn_folder = dataset_path / '02_cnn_images'
-    for npy_file in cnn_folder.glob('*.npy'):
-        if 'image' in str(npy_file) and 'augmented' not in str(npy_file):
-            # Determine class from filename
-            filename = npy_file.stem
-            if 'baseline' in filename:
-                label = 0
-            elif 'healthy' in filename:
-                label = 1
-            elif 'tumor' in filename:
-                label = 2
-            else:
-                continue
-            
-            img = np.load(npy_file)
-            # Add channel dimension (2, 201) -> (2, 201, 1)
-            img = img.reshape(2, 201, 1)
-            images.append(img)
-            labels.append(label)
-    
-    # Load augmented images
-    aug_folder = dataset_path / '03_cnn_augmented'
-    if aug_folder.exists():
-        for npy_file in aug_folder.glob('*.npy'):
-            filename = npy_file.stem
-            if 'tumor' in filename:
-                img = np.load(npy_file)
-                img = img.reshape(2, 201, 1)
-                images.append(img)
-                labels.append(2)  # Augmented tumor samples
-    
-    images = np.array(images, dtype=np.float32)
-    labels = np.array(labels, dtype=np.int32)
-    
-    print(f"✅ Loaded {len(images)} images")
-    for i, name in enumerate(class_names):
-        count = np.sum(labels == i)
-        print(f"   {name}: {count} ({count/len(images)*100:.1f}%)")
-    
-    return images, labels, class_names
-
 def main():
-    print("="*70)
+    print("="*60)
     print("PULMO AI: Train CNN on S21 Images")
-    print("="*70)
+    print("="*60)
     
     # Find latest dataset
     dataset_folders = sorted(Path('.').glob('ml_dataset_final_*'))
@@ -107,26 +62,34 @@ def main():
     latest_dataset = dataset_folders[-1]
     print(f"\n📁 Using dataset: {latest_dataset}")
     
-    # Load data
-    images, labels, class_names = load_dataset(latest_dataset)
+    # Load CNN images
+    cnn_images_path = latest_dataset / '02_cnn_images' / 'cnn_images.npy'
+    cnn_labels_path = latest_dataset / '02_cnn_images' / 'cnn_labels.npy'
     
-    if len(images) == 0:
-        print("❌ No images found!")
+    if not cnn_images_path.exists():
+        print("❌ CNN images not found! Run create_ml_images_final.py first")
         return
+    
+    images = np.load(cnn_images_path)
+    labels = np.load(cnn_labels_path)
+    
+    print(f"✅ Loaded {len(images)} images")
+    print(f"   Image shape: {images.shape}")
+    print(f"   Class distribution: {np.bincount(labels)}")
     
     # Shuffle and split
     indices = np.random.permutation(len(images))
     images = images[indices]
     labels = labels[indices]
     
-    split = int(0.8 * len(images))
+    split = int(0.7 * len(images))
     x_train, x_val = images[:split], images[split:]
     y_train, y_val = labels[:split], labels[split:]
     
     print(f"\n📊 Train: {len(x_train)}, Validation: {len(x_val)}")
     
     # Create model
-    model = create_cnn_model()
+    model = create_cnn_model(input_shape=(2, 201, 1), num_classes=3)
     model.summary()
     
     # Compile
@@ -141,18 +104,17 @@ def main():
         keras.callbacks.EarlyStopping(patience=20, restore_best_weights=True),
         keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=10, min_lr=1e-6),
         keras.callbacks.ModelCheckpoint(
-            str(latest_dataset / 'best_cnn_model.h5'), 
+            f'{latest_dataset}/best_model.keras', 
             save_best_only=True
         )
     ]
     
     # Train
-    print("\n🏋️ Training CNN...")
     history = model.fit(
         x_train, y_train,
         validation_data=(x_val, y_val),
         epochs=100,
-        batch_size=32,
+        batch_size=8,
         callbacks=callbacks,
         verbose=1
     )
@@ -179,32 +141,33 @@ def main():
     plt.grid(True)
     
     plt.tight_layout()
-    plt.savefig(latest_dataset / 'cnn_training_history.png', dpi=150)
-    print(f"\n📊 Saved: cnn_training_history.png")
+    plt.savefig(f'{latest_dataset}/training_history.png', dpi=150)
+    print(f"\n📊 Saved training history plot")
     
     # Evaluate
     val_loss, val_acc = model.evaluate(x_val, y_val)
     print(f"\n✅ Validation Accuracy: {val_acc:.4f}")
     
-    # Save model
-    model.save(latest_dataset / 'pulmo_cnn_model.h5')
+    # Save model as .keras (preferred format)
+    model.save(f'{latest_dataset}/pulmo_cnn_model.keras')
+    print(f"✅ Model saved: {latest_dataset}/pulmo_cnn_model.keras")
     
     # Convert to TFLite for Raspberry Pi
+    print("\n🔄 Converting to TFLite for Raspberry Pi...")
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     tflite_model = converter.convert()
     
-    with open(latest_dataset / 'pulmo_cnn_model.tflite', 'wb') as f:
+    with open(f'{latest_dataset}/pulmo_cnn_model.tflite', 'wb') as f:
         f.write(tflite_model)
-    
-    print(f"\n✅ Model saved to: {latest_dataset}/pulmo_cnn_model.h5")
-    print(f"✅ TFLite model saved to: {latest_dataset}/pulmo_cnn_model.tflite")
+    print(f"✅ TFLite model saved: {latest_dataset}/pulmo_cnn_model.tflite")
     
     # Save class names
-    with open(latest_dataset / 'class_names.json', 'w') as f:
+    class_names = ['baseline', 'healthy', 'tumor']
+    with open(f'{latest_dataset}/class_names.json', 'w') as f:
         json.dump(class_names, f)
     
-    print("\n🚀 DONE! CNN model trained successfully!")
+    print("\n🚀 Done! Model ready for Raspberry Pi deployment")
 
 if __name__ == "__main__":
     main()
