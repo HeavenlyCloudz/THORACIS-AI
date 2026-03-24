@@ -339,7 +339,7 @@ def main():
     xgb_df.to_csv(f"{output_base}/pulmo_xgboost_data.csv", index=False)
     
     if all_feature_vectors:
-        feature_names = sorted(processor.extract_all_features({1: np.zeros(201)}).keys())
+        feature_names = sorted(processor.extract_all_features({1: np.zeros(201), 2: np.zeros(201)}).keys())
         xgb_engineered_df = pd.DataFrame(all_feature_vectors, columns=feature_names)
         xgb_engineered_df['class'] = all_labels
         xgb_engineered_df.to_csv(f"{output_base}/pulmo_xgboost_engineered.csv", index=False)
