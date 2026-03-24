@@ -1,123 +1,139 @@
 # train_xgboost.py
 """
-PULMO AI: Train XGBoost on Microwave Features
+Train XGBoost classifier on extracted microwave features
 """
 import numpy as np
 import pandas as pd
+import pickle
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, cross_val_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
-from xgboost import XGBClassifier
-import pickle
-import json
+import xgboost as xgb
+import seaborn as sns
 from pathlib import Path
 
 def main():
-    print("="*70)
+    print("="*60)
     print("PULMO AI: Train XGBoost on Microwave Features")
-    print("="*70)
+    print("="*60)
     
     # Find latest dataset
     dataset_folders = sorted(Path('.').glob('ml_dataset_final_*'))
     if not dataset_folders:
         print("❌ No ml_dataset_final_* folders found!")
-        print("   Run create_ml_images_final.py first")
         return
     
-    latest_folder = dataset_folders[-1]
-    print(f"\n📁 Using dataset: {latest_folder}")
+    latest_dataset = dataset_folders[-1]
+    print(f"\n📁 Using dataset: {latest_dataset}")
     
-    # Load data
-    data_path = latest_folder / 'pulmo_xgboost_data.csv'
-    if not data_path.exists():
-        print(f"❌ No XGBoost data found at {data_path}")
+    # Load engineered features (better than raw)
+    engineered_path = latest_dataset / 'pulmo_xgboost_engineered.csv'
+    
+    if not engineered_path.exists():
+        print("❌ Engineered features not found! Run create_ml_images_final.py first")
         return
     
-    df = pd.read_csv(data_path)
-    print(f"\n📊 Loaded {len(df)} samples")
+    df = pd.read_csv(engineered_path)
+    print(f"✅ Loaded {len(df)} samples with {len(df.columns)-3} features")
     
     # Separate features and labels
-    feature_cols = [c for c in df.columns if c.startswith('freq_')]
+    feature_cols = [c for c in df.columns if c not in ['class', 'tumor_size_mm', 'sample_id']]
     X = df[feature_cols].values
     y = df['class'].values
     
-    print(f"   Features: {X.shape[1]} (2 paths × 201 frequencies)")
-    print(f"   Classes: {np.unique(y)}")
+    print(f"\n📊 Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
     
     # Scale features
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
-    # Train/test split (handling small dataset)
-    if len(np.unique(y)) >= 2 and min(np.bincount(y)) >= 2:
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_scaled, y, test_size=0.2, random_state=42, stratify=y
-        )
-        print(f"\n✅ Stratified split: {len(X_train)} train, {len(X_val)} val")
-    else:
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_scaled, y, test_size=0.2, random_state=42
-        )
-        print(f"\n✅ Simple split: {len(X_train)} train, {len(X_val)} val")
+    # Train/test split
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_scaled, y, test_size=0.2, random_state=42, stratify=y
+    )
+    
+    print(f"\n📊 Train: {len(X_train)} samples")
+    print(f"   Validation: {len(X_val)} samples")
     
     # Train XGBoost
-    print("\n🏋️ Training XGBoost...")
-    model = XGBClassifier(
+    print("\n🏗️ Training XGBoost...")
+    
+    model = xgb.XGBClassifier(
         n_estimators=100,
-        max_depth=3,
+        max_depth=4,
         learning_rate=0.1,
-        random_state=42
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=42,
+        eval_metric='mlogloss'
     )
-    model.fit(X_train, y_train)
     
-    # Evaluate
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_val, y_val)],
+        verbose=False
+    )
+    
+    # Predictions
     y_pred = model.predict(X_val)
-    y_pred_train = model.predict(X_train)
+    y_pred_proba = model.predict_proba(X_val)
     
-    print(f"\n📊 Training Accuracy: {accuracy_score(y_train, y_pred_train):.4f}")
-    print(f"📊 Validation Accuracy: {accuracy_score(y_val, y_pred):.4f}")
+    # Metrics
+    val_acc = accuracy_score(y_val, y_pred)
+    print(f"\n✅ Validation Accuracy: {val_acc:.4f}")
+    
+    # Classification report
+    class_names = ['baseline', 'healthy', 'tumor']
+    print("\n📊 Classification Report:")
+    print(classification_report(y_val, y_pred, target_names=class_names))
+    
+    # Confusion matrix
+    cm = confusion_matrix(y_val, y_pred)
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=class_names, yticklabels=class_names)
+    plt.title('XGBoost Confusion Matrix')
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.tight_layout()
+    plt.savefig(f'{latest_dataset}/xgboost_confusion_matrix.png', dpi=150)
+    print(f"✅ Saved: {latest_dataset}/xgboost_confusion_matrix.png")
     
     # Feature importance
-    importance = model.feature_importances_
-    top_indices = np.argsort(importance)[-20:]
+    feature_importance = pd.DataFrame({
+        'feature': feature_cols,
+        'importance': model.feature_importances_
+    }).sort_values('importance', ascending=False)
     
-    plt.figure(figsize=(10, 6))
-    plt.barh(range(20), importance[top_indices])
-    plt.yticks(range(20), [f'Freq {i}' for i in top_indices])
-    plt.xlabel('Feature Importance')
-    plt.title('Top 20 Most Important Frequency Features')
+    print("\n📈 Top 10 Features:")
+    print(feature_importance.head(10).to_string(index=False))
+    
+    # Plot feature importance
+    plt.figure(figsize=(10, 8))
+    plt.barh(feature_importance.head(15)['feature'], feature_importance.head(15)['importance'])
+    plt.xlabel('Importance')
+    plt.title('Top 15 Features - XGBoost')
     plt.tight_layout()
-    plt.savefig(latest_folder / 'xgboost_feature_importance.png', dpi=150)
-    print(f"\n📊 Saved: xgboost_feature_importance.png")
+    plt.savefig(f'{latest_dataset}/xgboost_feature_importance.png', dpi=150)
+    print(f"✅ Saved: {latest_dataset}/xgboost_feature_importance.png")
     
     # Save model and scaler
-    model_path = latest_folder / 'xgboost_model.pkl'
-    scaler_path = latest_folder / 'xgboost_scaler.pkl'
-    
-    with open(model_path, 'wb') as f:
+    with open(f'{latest_dataset}/xgboost_model.pkl', 'wb') as f:
         pickle.dump(model, f)
-    with open(scaler_path, 'wb') as f:
+    
+    with open(f'{latest_dataset}/xgboost_scaler.pkl', 'wb') as f:
         pickle.dump(scaler, f)
     
-    print(f"\n✅ Model saved to: {model_path}")
-    print(f"✅ Scaler saved to: {scaler_path}")
+    # Save feature names
+    with open(f'{latest_dataset}/xgboost_features.json', 'w') as f:
+        import json
+        json.dump(feature_cols, f, indent=2)
     
-    # Save metadata
-    metadata = {
-        'model_type': 'XGBoost',
-        'num_features': X.shape[1],
-        'num_samples': len(df),
-        'class_distribution': {int(k): int(v) for k, v in zip(*np.unique(y, return_counts=True))},
-        'train_accuracy': float(accuracy_score(y_train, y_pred_train)),
-        'val_accuracy': float(accuracy_score(y_val, y_pred))
-    }
+    print(f"\n✅ Model saved: {latest_dataset}/xgboost_model.pkl")
+    print(f"✅ Scaler saved: {latest_dataset}/xgboost_scaler.pkl")
     
-    with open(latest_folder / 'xgboost_metadata.json', 'w') as f:
-        json.dump(metadata, f, indent=2)
-    
-    print("\n🚀 DONE! XGBoost model trained successfully!")
+    print("\n🚀 XGBoost training complete!")
 
 if __name__ == "__main__":
     main()
