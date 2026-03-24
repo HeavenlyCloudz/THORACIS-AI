@@ -1,7 +1,8 @@
-# create_ml_images_final.py
+# create_ml_images_final.py - FIXED for small dataset
 """
 PULMO AI: Convert S21 Scans to ML-Ready Formats
-UPDATED: Background subtraction + Only Paths 1 & 2 (aligned opposite pairs)
+UPDATED: Background subtraction + Only Paths 1 & 2
+FIXED: Handles small datasets (1 sample per class)
 """
 import numpy as np
 import pandas as pd
@@ -14,6 +15,8 @@ from scipy.ndimage import gaussian_filter
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 import pickle
+import warnings
+warnings.filterwarnings('ignore', category=DeprecationWarning)
 
 # CONFIGURATION - Only use these paths (aligned opposite pairs)
 VALID_PATHS = [1, 2]  # Path 1: 1→3, Path 2: 2→4
@@ -136,7 +139,8 @@ class S21DataProcessor:
                 features[f'path{path_num}_peak_freq'] = self.frequencies[peak_idx]
                 features[f'path{path_num}_peak_value'] = s21[peak_idx]
                 
-                features[f'path{path_num}_energy'] = np.trapz(s21, self.frequencies)
+                # Use trapezoid instead of trapz (deprecated)
+                features[f'path{path_num}_energy'] = np.trapezoid(s21, self.frequencies)
         return features
     
     def extract_path_difference_features(self, path_data):
@@ -146,10 +150,7 @@ class S21DataProcessor:
         if 1 in path_data and 2 in path_data:
             diff_1_2 = np.mean(path_data[1] - path_data[2])
             features['diff_path1_path2'] = diff_1_2
-            
-            # Asymmetry index
-            asymmetry = np.mean(path_data[1] - path_data[2])
-            features['asymmetry_index'] = asymmetry
+            features['asymmetry_index'] = diff_1_2
         
         return features
     
@@ -246,6 +247,7 @@ def main():
     all_labels = []
     all_tumor_sizes = []
     all_cnn_images = []
+    all_sample_ids = []
     
     print("\n📥 Processing conditions with background subtraction...")
     
@@ -263,8 +265,8 @@ def main():
         else:
             path_data, num_files = processor.load_with_background_subtraction(folder_path, baseline_data)
         
-        if not path_data:
-            print(f"     No data found")
+        if not path_data or all(np.isnan(path_data[p]).all() for p in path_data):
+            print(f"     No valid data found")
             continue
         
         print(f"     Found {num_files} CSV files")
@@ -282,6 +284,7 @@ def main():
         all_labels.append(class_label)
         all_tumor_sizes.append(tumor_size)
         all_cnn_images.append(cnn_image_norm)
+        all_sample_ids.append(folder_name)
         
         # Save individual files
         features_df = pd.DataFrame([raw_features])
@@ -331,17 +334,26 @@ def main():
     print("📊 CREATING MASTER DATASETS")
     print("="*70)
     
+    if len(all_raw_features) == 0:
+        print("❌ No data to process!")
+        return
+    
     # XGBoost datasets
     xgb_df = pd.DataFrame(all_raw_features)
     xgb_df.columns = [f'freq_{i}' for i in range(len(all_raw_features[0]))]
     xgb_df['class'] = all_labels
     xgb_df['tumor_size_mm'] = all_tumor_sizes
+    xgb_df['sample_id'] = all_sample_ids
     xgb_df.to_csv(f"{output_base}/pulmo_xgboost_data.csv", index=False)
     
     if all_feature_vectors:
-        feature_names = sorted(processor.extract_all_features({1: np.zeros(201), 2: np.zeros(201)}).keys())
+        # Get feature names dynamically
+        temp_features = processor.extract_all_features({1: np.zeros(processor.num_points), 2: np.zeros(processor.num_points)})
+        feature_names = sorted(temp_features.keys())
         xgb_engineered_df = pd.DataFrame(all_feature_vectors, columns=feature_names)
         xgb_engineered_df['class'] = all_labels
+        xgb_engineered_df['tumor_size_mm'] = all_tumor_sizes
+        xgb_engineered_df['sample_id'] = all_sample_ids
         xgb_engineered_df.to_csv(f"{output_base}/pulmo_xgboost_engineered.csv", index=False)
     
     # CNN dataset
@@ -349,11 +361,26 @@ def main():
     np.save(f"{dirs['cnn_images']}/cnn_images.npy", cnn_images_array)
     np.save(f"{dirs['cnn_images']}/cnn_labels.npy", np.array(all_labels))
     
-    # Train/val splits
+    # Train/val splits - handle small dataset gracefully
     X = np.array(all_raw_features)
     y = np.array(all_labels)
     
-    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    # Check if we have enough samples for stratification
+    unique, counts = np.unique(y, return_counts=True)
+    min_samples = min(counts)
+    
+    if min_samples >= 2:
+        # Can do stratified split
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        print(f"✅ Stratified split: {len(X_train)} train, {len(X_val)} val")
+    else:
+        # Simple split without stratification
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42
+        )
+        print(f"✅ Simple split (stratification not possible): {len(X_train)} train, {len(X_val)} val")
     
     np.save(f"{dirs['models']}/X_train.npy", X_train)
     np.save(f"{dirs['models']}/X_val.npy", X_val)
@@ -368,7 +395,23 @@ def main():
     print(f"\n✅ XGBoost Dataset: {len(all_raw_features)} samples, {len(all_raw_features[0])} features")
     print(f"   Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
     print(f"✅ CNN Dataset: {cnn_images_array.shape}")
-    print(f"✅ Train/Val splits: {len(X_train)} train, {len(X_val)} val")
+    
+    # Save metadata
+    metadata = {
+        'timestamp': timestamp,
+        'paths_used': VALID_PATHS,
+        'num_samples': len(all_raw_features),
+        'num_augmented': len(list(Path(dirs['cnn_augmented']).glob('*.npy'))),
+        'feature_dims': {
+            'raw': len(all_raw_features[0]),
+            'engineered': len(all_feature_vectors[0]) if all_feature_vectors else 0
+        },
+        'class_distribution': {int(k): int(v) for k, v in zip(unique, counts)},
+        'samples': all_sample_ids
+    }
+    
+    with open(f"{output_base}/dataset_metadata.json", 'w') as f:
+        json.dump(metadata, f, indent=2)
     
     print(f"\n📁 Output folder: {output_base}/")
     print("\n🚀 DONE! Now you can train your models!")
