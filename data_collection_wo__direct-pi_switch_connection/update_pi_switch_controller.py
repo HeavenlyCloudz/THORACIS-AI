@@ -1,9 +1,9 @@
-# update_pi_switch_controller.py - UPDATED
+# update_pi_switch_controller.py.py
 """
-RF Switch Controller for Raspberry Pi - OPTIMIZED FOR PATHS 1 & 2 ONLY
-Only configures paths that actually work (1→3 and 2→4)
+RF Switch Controller for Raspberry Pi - ALL 4 PATHS
 """
 import RPi.GPIO as GPIO
+import time
 
 GPIO.setmode(GPIO.BCM)
 pins = [17, 27, 18, 22]
@@ -16,22 +16,34 @@ def set_path(path_num):
     if path_num == 1:      # 1→3 (both switches on Path A)
         GPIO.output(17, 1); GPIO.output(27, 0)  # Switch 1: Antenna 1
         GPIO.output(18, 1); GPIO.output(22, 0)  # Switch 2: Antenna 3
-        print(f"Path 1 set: Antenna 1 → Antenna 3 (aligned, opposite)")
+        print(f"Path 1 set: Antenna 1 → Antenna 3 (opposite)")
         
-    elif path_num == 2:    # 2→4 (both switches on Path B)
+    elif path_num == 2:    # 1→4 (Switch1 A, Switch2 B)
+        GPIO.output(17, 1); GPIO.output(27, 0)  # Switch 1: Antenna 1
+        GPIO.output(18, 0); GPIO.output(22, 1)  # Switch 2: Antenna 4
+        print(f"Path 2 set: Antenna 1 → Antenna 4 (diagonal)")
+        
+    elif path_num == 3:    # 2→3 (Switch1 B, Switch2 A)
+        GPIO.output(17, 0); GPIO.output(27, 1)  # Switch 1: Antenna 2
+        GPIO.output(18, 1); GPIO.output(22, 0)  # Switch 2: Antenna 3
+        print(f"Path 3 set: Antenna 2 → Antenna 3 (diagonal)")
+        
+    elif path_num == 4:    # 2→4 (both switches on Path B)
         GPIO.output(17, 0); GPIO.output(27, 1)  # Switch 1: Antenna 2
         GPIO.output(18, 0); GPIO.output(22, 1)  # Switch 2: Antenna 4
-        print(f"Path 2 set: Antenna 2 → Antenna 4 (aligned, opposite)")
+        print(f"Path 4 set: Antenna 2 → Antenna 4 (opposite)")
         
     else:
-        print(f"⚠️ Path {path_num} is not optimized (use 1 or 2 only)")
-        print("   Paths 3 and 4 have poor alignment - skipping")
+        print(f"Invalid path number: {path_num}")
 
 print("="*50)
-print("PULMO AI - RF SWITCH CONTROLLER (OPTIMIZED)")
+print("PULMO AI - RF SWITCH CONTROLLER (ALL 4 PATHS)")
 print("="*50)
-print("Only Paths 1 and 2 are used (aligned opposite pairs)")
-print("Enter path number (1 or 2) when prompted")
+print("Enter path number (1-4) when prompted by computer")
+print("  Path 1: Antenna 1 → Antenna 3 (opposite)")
+print("  Path 2: Antenna 1 → Antenna 4 (diagonal)")
+print("  Path 3: Antenna 2 → Antenna 3 (diagonal)")
+print("  Path 4: Antenna 2 → Antenna 4 (opposite)")
 print("Type 'q' to quit\n")
 
 try:
@@ -41,11 +53,11 @@ try:
             break
         try:
             path = int(cmd)
-            if path == 1 or path == 2:
+            if 1 <= path <= 4:
                 set_path(path)
-                print("✅ Ready for capture\n")
+                print("✅ Ready for capture on computer\n")
             else:
-                print(f"Enter 1 or 2 (Path {path} is not optimized)\n")
+                print("Enter 1-4\n")
         except:
             print("Invalid input\n")
 finally:
