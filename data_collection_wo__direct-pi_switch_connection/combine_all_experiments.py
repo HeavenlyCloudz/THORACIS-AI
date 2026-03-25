@@ -1,21 +1,22 @@
-# combine_all_experiments.py
+# combine_all_experiments_rotations.py
 """
-Combine all phantom experiments into one large dataset
-Uses ALL 4 paths after background subtraction
+Combine all experiments - keep rotations separate
+Each sample = one rotation (all 4 paths concatenated)
+Total: 3 experiments × 3 conditions × 3 rotations = 27 samples
 """
 import numpy as np
 import pandas as pd
 from pathlib import Path
 import os
 import json
+from collections import defaultdict
 
-def load_experiment_data(exp_folder, valid_paths=[1, 2, 3, 4]):
+def load_experiment_by_rotation(exp_folder):
     """
-    Load all condition data from an experiment folder
-    Uses ALL paths (after background subtraction, they all work)
+    Load data from experiment, keeping rotations separate
+    Returns: dict with condition -> rotation -> {path_num: s21_array}
     """
     conditions = ['01_baseline_air', '02_healthy_phantom', '03_tumor_phantom']
-    
     exp_data = {}
     
     for condition in conditions:
@@ -23,158 +24,125 @@ def load_experiment_data(exp_folder, valid_paths=[1, 2, 3, 4]):
         if not condition_folder.exists():
             continue
         
-        # Load all CSV files for this condition
-        data_by_path = {p: [] for p in valid_paths}
+        # Group by rotation first
+        rotation_data = defaultdict(lambda: defaultdict(list))
         
         for csv_file in condition_folder.glob('*.csv'):
             df = pd.read_csv(csv_file)
             s21 = df['S21_dB'].values
             
-            # Extract path number from filename
+            # Extract metadata
             filename = csv_file.stem
             parts = filename.split('_')
+            
             path_num = None
+            rotation = None
             for part in parts:
                 if part.startswith('path'):
                     path_num = int(part[4])
-                    break
+                if part.startswith('rot'):
+                    rotation = int(part[3])
             
-            if path_num in valid_paths:
-                data_by_path[path_num].append(s21)
+            if path_num and rotation is not None:
+                rotation_data[rotation][path_num].append(s21)
         
-        # Average multiple runs per path
-        path_averages = {}
-        for path_num in valid_paths:
-            if data_by_path[path_num]:
-                path_averages[path_num] = np.mean(data_by_path[path_num], axis=0)
+        # Average multiple runs for each (rotation, path)
+        averaged_rotations = {}
+        for rotation, path_data in rotation_data.items():
+            averaged_paths = {}
+            for path_num, s21_list in path_data.items():
+                if s21_list:
+                    averaged_paths[path_num] = np.mean(s21_list, axis=0)
+            if len(averaged_paths) == 4:  # All 4 paths present
+                averaged_rotations[rotation] = averaged_paths
         
-        exp_data[condition] = path_averages
+        if averaged_rotations:
+            exp_data[condition] = averaged_rotations
     
     return exp_data
 
-def load_all_experiments():
-    """
-    Load data from all phantom_data_* folders
-    """
-    all_samples = []
-    all_labels = []
+def main():
+    print("="*70)
+    print("PULMO AI: Combine Experiments (Keep Rotations Separate)")
+    print("="*70)
     
     # Find all experiment folders
     exp_folders = sorted([d for d in os.listdir('.') if d.startswith('phantom_data_')])
-    
-    print(f"📁 Found {len(exp_folders)} experiment folders:")
+    print(f"\n📁 Found {len(exp_folders)} experiment folders:")
     for f in exp_folders:
         print(f"   - {f}")
+    
+    all_samples = []
+    all_labels = []
+    all_metadata = []
+    
+    condition_to_class = {
+        '01_baseline_air': 0,
+        '02_healthy_phantom': 1,
+        '03_tumor_phantom': 2
+    }
     
     for exp_idx, exp_folder in enumerate(exp_folders):
         print(f"\n📂 Loading {exp_folder}...")
         
-        exp_data = load_experiment_data(exp_folder)
+        exp_data = load_experiment_by_rotation(exp_folder)
         
-        # Process each condition
-        for condition_name, path_data in exp_data.items():
-            if condition_name == '01_baseline_air':
-                class_label = 0
-                class_name = 'baseline'
-            elif condition_name == '02_healthy_phantom':
-                class_label = 1
-                class_name = 'healthy'
-            elif condition_name == '03_tumor_phantom':
-                class_label = 2
-                class_name = 'tumor'
-            else:
-                continue
+        if not exp_data:
+            print(f"   ⚠️ No valid data found")
+            continue
+        
+        for condition, rotations_data in exp_data.items():
+            class_label = condition_to_class[condition]
             
-            # Create one sample per path
-            for path_num, s21 in path_data.items():
-                # Convert to 402-dim vector (4 paths × 201 freq points)
-                # But we need all 4 paths together for each sample
-                # Actually, let's store each path separately for now
-                all_samples.append({
-                    'exp_id': exp_idx,
-                    'condition': class_name,
+            for rotation, path_data in rotations_data.items():
+                # Concatenate all 4 paths in order: path1, path2, path3, path4
+                feature_vector = np.concatenate([
+                    path_data[1],  # Path 1
+                    path_data[2],  # Path 2
+                    path_data[3],  # Path 3
+                    path_data[4]   # Path 4
+                ])
+                
+                all_samples.append(feature_vector)
+                all_labels.append(class_label)
+                all_metadata.append({
+                    'experiment': exp_folder,
+                    'condition': condition,
                     'class': class_label,
-                    'path': path_num,
-                    's21': s21,
-                    'experiment': exp_folder
+                    'exp_id': exp_idx,
+                    'rotation': rotation
                 })
                 
-                all_labels.append(class_label)
-        
-        print(f"   Added {len(path_data) * 3} samples")
+                print(f"   {condition} - Rotation {rotation}°: added sample (class {class_label})")
     
-    return all_samples
-
-def create_feature_matrix(all_samples):
-    """
-    Convert samples to feature matrix
-    Each sample = concatenated S21 from all 4 paths = 804 features
-    """
-    # Group by condition + experiment (each "sample" should have all 4 paths)
-    grouped = {}
+    if not all_samples:
+        print("❌ No samples loaded!")
+        return
     
-    for sample in all_samples:
-        key = (sample['exp_id'], sample['condition'])
-        if key not in grouped:
-            grouped[key] = {1: None, 2: None, 3: None, 4: None}
-        grouped[key][sample['path']] = sample['s21']
+    X = np.array(all_samples)
+    y = np.array(all_labels)
     
-    X = []
-    y = []
-    metadata = []
-    
-    for (exp_id, condition), path_data in grouped.items():
-        # Check if we have all 4 paths
-        if all(path_data[p] is not None for p in [1, 2, 3, 4]):
-            # Concatenate all paths in order: path1, path2, path3, path4
-            feature_vector = np.concatenate([
-                path_data[1], path_data[2], path_data[3], path_data[4]
-            ])
-            X.append(feature_vector)
-            
-            # Get class label from first sample (all in this group have same class)
-            label = next(s for s in all_samples if s['exp_id'] == exp_id and s['condition'] == condition)['class']
-            y.append(label)
-            
-            metadata.append({
-                'exp_id': exp_id,
-                'condition': condition,
-                'has_path1': True,
-                'has_path2': True,
-                'has_path3': True,
-                'has_path4': True
-            })
-    
-    return np.array(X), np.array(y), metadata
-
-def main():
-    print("="*70)
-    print("PULMO AI: Combine All Experiments")
-    print("="*70)
-    
-    # Load all experiments
-    all_samples = load_all_experiments()
-    print(f"\n✅ Total samples loaded: {len(all_samples)}")
-    
-    # Create feature matrix (804 features = 4 paths × 201 freq points)
-    X, y, metadata = create_feature_matrix(all_samples)
-    
-    print(f"\n📊 Combined dataset:")
-    print(f"   Total samples: {len(X)}")
-    print(f"   Features per sample: {X.shape[1]}")
+    print(f"\n✅ Total samples loaded: {len(X)}")
+    print(f"   Features per sample: {X.shape[1]} (4 paths × 201 freq points)")
     print(f"   Class distribution:")
-    print(f"      Baseline: {(y==0).sum()}")
-    print(f"      Healthy: {(y==1).sum()}")
-    print(f"      Tumor: {(y==2).sum()}")
+    print(f"      Baseline (0): {(y==0).sum()}")
+    print(f"      Healthy (1): {(y==1).sum()}")
+    print(f"      Tumor (2): {(y==2).sum()}")
+    print(f"   Rotations per condition: {len(set(m['rotation'] for m in all_metadata))}")
+    print(f"   Unique experiments: {len(set(m['exp_id'] for m in all_metadata))}")
     
     # Save combined dataset
-    output_dir = "pulmo_combined_dataset"
+    output_dir = "pulmo_combined_rotations"
     os.makedirs(output_dir, exist_ok=True)
     
     # Save as CSV for XGBoost
     df = pd.DataFrame(X)
     df.columns = [f'freq_{i}' for i in range(X.shape[1])]
     df['class'] = y
+    df['exp_id'] = [m['exp_id'] for m in all_metadata]
+    df['experiment'] = [m['experiment'] for m in all_metadata]
+    df['condition'] = [m['condition'] for m in all_metadata]
+    df['rotation'] = [m['rotation'] for m in all_metadata]
     df.to_csv(f"{output_dir}/pulmo_combined.csv", index=False)
     
     # Save numpy arrays
@@ -188,12 +156,15 @@ def main():
             'num_features': X.shape[1],
             'num_paths': 4,
             'freq_points': 201,
+            'num_rotations': len(set(m['rotation'] for m in all_metadata)),
             'class_distribution': {
                 'baseline': int((y==0).sum()),
                 'healthy': int((y==1).sum()),
                 'tumor': int((y==2).sum())
             },
-            'experiments_used': len(set(m['exp_id'] for m in metadata))
+            'experiments_used': len(set(m['exp_id'] for m in all_metadata)),
+            'samples_per_experiment': len(all_metadata) // len(set(m['exp_id'] for m in all_metadata)),
+            'description': 'Each sample = one rotation (all 4 paths concatenated)'
         }, f, indent=2)
     
     print(f"\n📁 Saved to: {output_dir}/")
@@ -202,14 +173,12 @@ def main():
     print("   - y_combined.npy")
     print("   - metadata.json")
     
-    # Quick stats
-    print(f"\n📊 Statistics per class:")
-    for class_name, class_label in [('baseline', 0), ('healthy', 1), ('tumor', 2)]:
-        class_X = X[y == class_label]
-        if len(class_X) > 0:
-            print(f"   {class_name}: {len(class_X)} samples")
+    print(f"\n📊 Per-experiment breakdown:")
+    for exp_id in sorted(set(m['exp_id'] for m in all_metadata)):
+        exp_samples = [m for m in all_metadata if m['exp_id'] == exp_id]
+        print(f"   Experiment {exp_id}: {len(exp_samples)} samples")
     
-    print("\n🎉 Now you have a much larger dataset for training!")
+    print(f"\n🎉 Now you have {len(X)} samples (keeping rotations separate)!")
 
 if __name__ == "__main__":
     main()
