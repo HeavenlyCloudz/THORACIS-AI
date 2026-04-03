@@ -7,8 +7,16 @@ PULMO‑AI Unified Application – TFLite Only Version
 - Network VNA communication
 """
 
-import sys
 import os
+
+# Force OpenGL ES – must be set before any Qt imports
+if 'QT_OPENGL' not in os.environ:
+    os.environ['QT_OPENGL'] = 'es2'
+# Do NOT set QT_QPA_PLATFORM here – let the shell decide
+if 'QT_QPA_EGLFS_HIDECURSOR' not in os.environ:
+    os.environ['QT_QPA_EGLFS_HIDECURSOR'] = '1'
+
+import sys
 import time
 import json
 import threading
@@ -19,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 import pickle
 
-# Qt
+# Qt (now that environment is set, import safely)
 from PySide6 import QtWidgets, QtGui, QtCore
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QPainter, QPen, QColor
@@ -43,13 +51,10 @@ MODEL_DIR = Path.home() / "pulmo_ai_app" / "models"
 AUDIO_MODEL_PATH = MODEL_DIR / "lung_audio.tflite"
 FUSION_MODEL_PATH = MODEL_DIR / "fusion_xgboost_model.pkl"
 FUSION_SCALER_PATH = MODEL_DIR / "fusion_scaler.pkl"
-
-# YAMNet TFLite model (you'll need to download this)
-# Download from: https://tfhub.dev/google/yamnet/1
 YAMNET_TFLITE_PATH = MODEL_DIR / "yamnet.tflite"
 
 # Network VNA settings
-VNA_SERVER_IP = "192.168.1.100"  # ← CHANGE TO YOUR COMPUTER'S IP ADDRESS
+VNA_SERVER_IP = "192.168.1.77" 
 VNA_SERVER_PORT = 9999
 
 # GPIO pins (RF switches)
@@ -413,7 +418,6 @@ class PulmoAIMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PULMO‑AI: Lung Screening System")
-        self.showFullScreen()
         
         # Initialize components
         self.vna_client = VNAClient(VNA_SERVER_IP, VNA_SERVER_PORT)
@@ -431,11 +435,15 @@ class PulmoAIMainWindow(QMainWindow):
         self.baseline_data = None
         
         self._setup_ui()
+        
+        # IMPORTANT: Call showFullScreen AFTER all widgets are set up
+        self.showFullScreen()
     
     def _setup_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)   # Remove margins for full-screen
         layout.setSpacing(15)
         
         # Title
@@ -521,6 +529,8 @@ class PulmoAIMainWindow(QMainWindow):
     def _add_microwave_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)   # Remove margins
+        layout.setSpacing(10)
         
         self.mw_status = QLabel("✅ Ready")
         self.mw_status.setStyleSheet("font-size: 14px; padding: 8px; background: #e8f5e9; border-radius: 8px;")
@@ -558,6 +568,8 @@ class PulmoAIMainWindow(QMainWindow):
     def _add_audio_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)   # Remove margins
+        layout.setSpacing(10)
         
         self.audio_status = QLabel("✅ Ready")
         self.audio_status.setStyleSheet("font-size: 14px; padding: 8px; background: #e8f5e9; border-radius: 8px;")
@@ -584,6 +596,8 @@ class PulmoAIMainWindow(QMainWindow):
     def _add_fusion_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)   # Remove margins
+        layout.setSpacing(10)
         
         self.fusion_status = QLabel("Perform both scans for combined diagnosis")
         self.fusion_status.setStyleSheet("font-size: 14px; padding: 8px; background: #fff3e0; border-radius: 8px;")
@@ -850,14 +864,22 @@ class PulmoAIMainWindow(QMainWindow):
 # MAIN
 # =============================================================================
 if __name__ == '__main__':
-    # Force fullscreen for Pi
-    os.environ['QT_QPA_PLATFORM'] = 'eglfs'
-    os.environ['QT_QPA_EGLFS_HIDECURSOR'] = '1'
-    
-    app = QtWidgets.QApplication(sys.argv)
-    app.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+    import os
+
+    # Only set OpenGL ES attribute if we are actually using eglfs
+    platform = os.environ.get('QT_QPA_PLATFORM', '')
+    if platform == 'eglfs':
+        QApplication.setAttribute(Qt.AA_UseOpenGLES, True)
+
+    app = QApplication(sys.argv)
+    # HighDPI scaling is not needed for linuxfb, and may cause issues; removed.
+
     window = PulmoAIMainWindow()
-    window.show()
-    
+    # Optionally force the window to fill the screen (though showFullScreen should handle it)
+    # screen = QApplication.primaryScreen()
+    # window.setGeometry(0, 0, screen.size().width(), screen.size().height())
+    window.showFullScreen()   # already called in constructor, but safe to call again
+
     sys.exit(app.exec())
