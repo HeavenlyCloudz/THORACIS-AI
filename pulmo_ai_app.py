@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 PULMO AI - Operation Oracle: Democratized Lung Screening System
-- Phase-based microwave reconstruction
-- Multi-angle scanning (0°, 120°, 240°)
-- Tumor localization with bounding boxes
-- Confidence-based heatmap visualization
-- YAMNet audio processing
 """
 
 import os
 
-# Forces OpenGL ES bc it must be set before any Qt imports
+# Force OpenGL ES - must be set before any Qt imports
 if 'QT_OPENGL' not in os.environ:
     os.environ['QT_OPENGL'] = 'es2'
 if 'QT_QPA_EGLFS_HIDECURSOR' not in os.environ:
@@ -30,18 +25,16 @@ import pickle
 import math
 import traceback
 import csv
-import struct
-import wave
-import subprocess
 
 # Qt
 from PySide6 import QtWidgets, QtGui, QtCore
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QPainter, QPen, QColor, QBrush, QLinearGradient
+from PySide6.QtGui import QPainter, QPen, QColor, QBrush
 from PySide6.QtWidgets import (
     QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
-    QWidget, QProgressBar, QMessageBox, QTabWidget, QTextEdit, QLineEdit,
-    QComboBox, QFrame, QScrollArea, QGroupBox
+    QWidget, QProgressBar, QMessageBox, QTabWidget, QTextEdit,
+    QFrame, QScrollArea, QGroupBox, QRadioButton, QButtonGroup,
+    QCheckBox
 )
 
 # Hardware
@@ -109,13 +102,22 @@ PATH_TO_ANTENNA_PAIR = {
 }
 
 # Multi-angle scanning configuration
-ROTATION_ANGLES = [0, 120, 240]  # Three rotations for full coverage like in my phantom scans training
+ROTATION_ANGLES = [0, 120, 240]
 
 # Audio settings
 SAMPLE_RATE = 16000
 RECORD_SECONDS = 3
 EXPECTED_AUDIO_SAMPLES = SAMPLE_RATE * RECORD_SECONDS
-YAMNET_EMBEDDING_SIZE = 1024
+
+# Feature dimensions - CRITICAL: Must match training!
+# 4 paths * 201 frequency points = 804 frequency features
+# + 36 time-domain features (9 per path) = 840 total
+N_FREQ_POINTS = POINTS  # 201
+N_PATHS = 4
+N_FREQ_FEATURES = N_PATHS * N_FREQ_POINTS  # 804
+N_TIME_FEATURES_PER_PATH = 9
+N_TIME_FEATURES = N_PATHS * N_TIME_FEATURES_PER_PATH  # 36
+TOTAL_FEATURES = N_FREQ_FEATURES + N_TIME_FEATURES  # 840
 
 # Model class order from training
 MODEL_CLASSES = ['bronchial', 'asthma', 'copd', 'healthy', 'pneumonia']
@@ -161,36 +163,515 @@ def linear_to_db(linear):
     return 10 * np.log10(linear)
 
 def add_time_domain_features(X):
-    """Add IFFT-based time-domain features"""
+    """
+    Add time-domain features via IFFT using magnitude-only data.
+    This matches your training pipeline exactly.
+    
+    Input: X shape (n_samples, 804) - magnitude values in dB
+    Output: X_augmented shape (n_samples, 840) - 804 freq + 36 time features
+    """
     n_samples, n_features = X.shape
+    n_freq = n_features  # 804 features = 4 paths * 201 freq points
     n_paths = 4
-    freq_per_path = n_features // n_paths
+    freq_per_path = n_freq // n_paths  # 201
     
     time_features = []
+    
     for sample in X:
-        sample_time = []
-        for p in range(n_paths):
-            start = p * freq_per_path
-            end = (p + 1) * freq_per_path
-            freq_resp = sample[start:end]
-            time_resp = np.abs(np.fft.ifft(freq_resp))
-            sample_time.extend([
-                np.max(time_resp), np.argmax(time_resp),
-                np.mean(time_resp), np.std(time_resp),
-                np.percentile(time_resp, 90), np.percentile(time_resp, 10),
-                np.sum(time_resp), np.max(time_resp) - np.min(time_resp),
-                np.sum(time_resp ** 2)
+        sample_time_features = []
+        for path in range(n_paths):
+            # Extract this path's frequency response
+            start_idx = path * freq_per_path
+            end_idx = (path + 1) * freq_per_path
+            freq_response = sample[start_idx:end_idx]
+            
+            # Convert from dB to linear magnitude
+            freq_response_linear = db_to_linear(freq_response)
+            
+            # IFFT to get time domain (magnitude-only, but consistent with training)
+            time_response = np.fft.ifft(freq_response_linear)
+            time_magnitude = np.abs(time_response)
+            
+            # Extract time-domain features
+            sample_time_features.extend([
+                np.max(time_magnitude),          # Peak in time domain
+                np.argmax(time_magnitude),       # Location of peak
+                np.mean(time_magnitude),         # Average energy
+                np.std(time_magnitude),          # Variation
+                np.percentile(time_magnitude, 90),  # 90th percentile
+                np.percentile(time_magnitude, 10),  # 10th percentile
+                np.sum(time_magnitude),          # Total energy
+                np.max(time_magnitude) - np.min(time_magnitude),  # Range
+                np.sum(np.square(time_magnitude)),  # Energy
             ])
-        time_features.append(sample_time)
+        
+        time_features.append(sample_time_features)
+    
     time_features = np.array(time_features)
-    return np.concatenate([X, time_features], axis=1)
+    X_augmented = np.concatenate([X, time_features], axis=1)
+    
+    return X_augmented
+
+# =============================================================================
+# SYMPTOM TO CONDITION MAPPING
+# =============================================================================
+
+class SymptomToConditionMapper:
+    """Maps patient-reported symptoms to condition probabilities"""
+    
+    def __init__(self):
+        self.conditions = ['asthma', 'copd', 'pneumonia', 'bronchitis', 'healthy']
+        
+        self.primary_mapping = {
+            'asthma': {
+                'chest_sensation': ['Tightness (like a band squeezing)'],
+                'lung_sounds': ['Wheezing (high-pitched whistling)'],
+                'symptom_pattern': ['Episodic (comes and goes)', 'Triggered by exercise/allergens', 'Worse at night'],
+                'cough_type': ['Dry cough (no mucus)']
+            },
+            'copd': {
+                'chest_sensation': ['Heavy or clogged feeling'],
+                'lung_sounds': ['Coarse crackles/Rhonchi (rattling/bubbling)'],
+                'symptom_pattern': ['Constant (always present)', 'Worse when lying down'],
+                'cough_type': ['Productive cough with clear mucus']
+            },
+            'pneumonia': {
+                'chest_sensation': ['Sharp pain when breathing deeply'],
+                'lung_sounds': ['Fine crackles (popping sounds)'],
+                'systemic_symptoms': ['Fever', 'Chills'],
+                'cough_type': ['Productive cough with yellow/green mucus']
+            },
+            'bronchitis': {
+                'chest_sensation': ['Rattling sensation when breathing'],
+                'lung_sounds': ['Coarse crackles/Rhonchi (rattling/bubbling)'],
+                'systemic_symptoms': ['Sore throat', 'Runny nose'],
+                'cough_type': ['Productive cough with clear mucus']
+            },
+            'healthy': {
+                'chest_sensation': ['No chest discomfort'],
+                'breathing_difficulty': ['No difficulty'],
+                'cough_type': ['No cough'],
+                'lung_sounds': ['Normal/No unusual sounds']
+            }
+        }
+        
+        self.secondary_mapping = {
+            'asthma': {
+                'breathing_difficulty': ['Mild - noticeable but not limiting', 'Moderate - limits some activities'],
+                'systemic_symptoms': []
+            },
+            'copd': {
+                'breathing_difficulty': ['Moderate - limits some activities', 'Severe - difficulty at rest'],
+                'systemic_symptoms': ['Fatigue', 'Weight loss', 'Swollen ankles']
+            },
+            'pneumonia': {
+                'breathing_difficulty': ['Severe - difficulty at rest'],
+                'systemic_symptoms': ['Fatigue', 'Fever', 'Chills']
+            },
+            'bronchitis': {
+                'breathing_difficulty': ['Mild - noticeable but not limiting'],
+                'systemic_symptoms': ['Sore throat', 'Runny nose']
+            },
+            'healthy': {
+                'systemic_symptoms': ['None of these']
+            }
+        }
+        
+        self.primary_weight = 3.0
+        self.secondary_weight = 1.0
+    
+    def calculate_condition_probabilities(self, patient_symptoms):
+        """Calculate probability for each condition based on reported symptoms"""
+        scores = {condition: 0.0 for condition in self.conditions}
+        
+        for condition in self.conditions:
+            score = 0.0
+            
+            # Check primary symptoms
+            primary_criteria = self.primary_mapping.get(condition, {})
+            for symptom_type, expected_values in primary_criteria.items():
+                if symptom_type in patient_symptoms:
+                    reported = patient_symptoms[symptom_type]
+                    if isinstance(reported, list):
+                        for r in reported:
+                            if r in expected_values:
+                                score += self.primary_weight
+                    else:
+                        if reported in expected_values:
+                            score += self.primary_weight
+            
+            # Check secondary symptoms
+            secondary_criteria = self.secondary_mapping.get(condition, {})
+            for symptom_type, expected_values in secondary_criteria.items():
+                if symptom_type in patient_symptoms:
+                    reported = patient_symptoms[symptom_type]
+                    if isinstance(reported, list):
+                        for r in reported:
+                            if r in expected_values:
+                                score += self.secondary_weight
+                    else:
+                        if reported in expected_values:
+                            score += self.secondary_weight
+            
+            scores[condition] = score
+        
+        # Convert scores to probabilities
+        total_score = sum(scores.values())
+        if total_score > 0:
+            probabilities = {c: scores[c] / total_score for c in self.conditions}
+        else:
+            probabilities = {c: 0.0 for c in self.conditions}
+            probabilities['healthy'] = 1.0
+        
+        return probabilities, scores
+
+# =============================================================================
+# ENHANCED CLINICAL DECISION SUPPORT
+# =============================================================================
+
+class EnhancedClinicalDecisionSupport:
+    """Combines AI acoustic analysis with patient-reported symptoms"""
+    
+    def __init__(self):
+        self.symptom_mapper = SymptomToConditionMapper()
+        self.ai_weight = 0.6
+        self.symptom_weight = 0.4
+    
+    def assess(self, ai_probs, patient_symptoms, environmental_quality="normal"):
+        """Combine AI predictions with patient symptoms"""
+        if environmental_quality == "poor":
+            self.ai_weight = 0.3
+            self.symptom_weight = 0.7
+        elif environmental_quality == "good":
+            self.ai_weight = 0.7
+            self.symptom_weight = 0.3
+        else:
+            self.ai_weight = 0.6
+            self.symptom_weight = 0.4
+        
+        # Get symptom-based probabilities
+        symptom_probs, _ = self.symptom_mapper.calculate_condition_probabilities(patient_symptoms)
+        
+        # Combine AI and symptom probabilities
+        final_probs = {}
+        for condition in ['asthma', 'copd', 'pneumonia', 'bronchitis', 'healthy']:
+            condition_idx = MODEL_CLASSES.index(condition) if condition in MODEL_CLASSES else 0
+            ai_score = ai_probs[condition_idx]
+            symptom_score = symptom_probs.get(condition, 0)
+            final_probs[condition] = (self.ai_weight * ai_score) + (self.symptom_weight * symptom_score)
+        
+        # Normalize
+        total = sum(final_probs.values())
+        if total > 0:
+            final_probs = {c: p/total for c, p in final_probs.items()}
+        
+        # Get final diagnosis
+        final_diagnosis = max(final_probs.items(), key=lambda x: x[1])
+        final_confidence = final_diagnosis[1]
+        
+        # Generate explanation
+        explanation = self._generate_explanation(
+            final_diagnosis[0], final_probs, ai_probs, symptom_probs, patient_symptoms, environmental_quality
+        )
+        
+        return final_diagnosis[0], final_confidence, explanation, final_probs
+    
+    def _generate_explanation(self, final_dx, final_probs, ai_probs, symptom_probs, symptoms, quality):
+        """Generate comprehensive clinical explanation"""
+        explanation = "CLINICAL DECISION ANALYSIS\n\n"
+        explanation += "=" * 50 + "\n\n"
+        
+        if quality == "poor":
+            explanation += "NOTE: Audio quality was poor. Diagnosis relies more heavily on patient-reported symptoms.\n\n"
+        
+        # AI Analysis Section
+        ai_dx_idx = np.argmax(ai_probs)
+        ai_dx = MODEL_CLASSES[ai_dx_idx]
+        ai_conf = ai_probs[ai_dx_idx]
+        
+        explanation += "1. ACOUSTIC ANALYSIS (AI)\n"
+        explanation += f"   Model detected: {ai_dx.upper()} with {ai_conf:.1%} confidence\n"
+        explanation += "   Sound patterns identified:\n"
+        
+        sound_findings = {
+            'asthma': "   - High-pitched wheezing during exhalation\n   - Prolonged expiratory phase\n",
+            'copd': "   - Coarse crackles and rhonchi\n   - Reduced breath sounds\n",
+            'pneumonia': "   - Fine crackles (popping sounds)\n   - Bronchial breath sounds\n",
+            'bronchitis': "   - Rattling/coarse sounds\n   - Mucus-related noises\n",
+            'healthy': "   - Clear breath sounds\n   - No abnormal adventitious sounds\n"
+        }
+        explanation += sound_findings.get(ai_dx, "   - Abnormal lung sounds detected\n")
+        explanation += f"   Confidence in acoustic diagnosis: {ai_conf:.1%}\n\n"
+        
+        # Patient Symptoms Section
+        explanation += "2. PATIENT-REPORTED SYMPTOMS\n"
+        
+        symptom_descriptions = {
+            'chest_sensation': 'Chest sensation',
+            'lung_sounds': 'Lung sounds noticed',
+            'cough_type': 'Cough type',
+            'breathing_difficulty': 'Breathing difficulty',
+            'symptom_pattern': 'Symptom pattern',
+            'systemic_symptoms': 'Additional symptoms'
+        }
+        
+        for symptom_type, description in symptom_descriptions.items():
+            if symptom_type in symptoms:
+                value = symptoms[symptom_type]
+                if isinstance(value, list) and value:
+                    explanation += f"   - {description}: {', '.join(value)}\n"
+                elif value:
+                    explanation += f"   - {description}: {value}\n"
+        
+        # Symptom-based diagnosis
+        symptom_dx = max(symptom_probs.items(), key=lambda x: x[1])
+        explanation += f"\n   Symptoms most consistent with: {symptom_dx[0].upper()} ({symptom_dx[1]:.1%})\n\n"
+        
+        # Combined Analysis Section
+        explanation += "3. COMBINED DIAGNOSIS\n\n"
+        explanation += f"   Final Diagnosis: {final_dx.upper()}\n"
+        explanation += f"   Overall Confidence: {final_confidence:.1%}\n\n"
+        
+        explanation += "   Decision weights:\n"
+        explanation += f"   - AI Analysis: {self.ai_weight:.0%}\n"
+        explanation += f"   - Patient Symptoms: {self.symptom_weight:.0%}\n\n"
+        
+        if final_dx == ai_dx and final_dx == symptom_dx[0]:
+            explanation += f"   AGREEMENT: AI and symptoms both indicate {final_dx.upper()}\n"
+            explanation += "   - High confidence in this diagnosis\n"
+        elif final_dx == ai_dx:
+            explanation += f"   AI analysis supports {final_dx.upper()}\n"
+            explanation += "   - Your reported symptoms differ somewhat\n"
+            explanation += "   - The acoustic patterns are the primary driver\n"
+        elif final_dx == symptom_dx[0]:
+            explanation += f"   Your symptoms strongly suggest {final_dx.upper()}\n"
+            explanation += "   - The AI detected different patterns\n"
+            explanation += "   - Consider clinical correlation\n"
+        else:
+            explanation += "   MIXED FINDINGS - consider clinical correlation\n"
+            explanation += f"   - AI suggests {ai_dx.upper()}\n"
+            explanation += f"   - Symptoms suggest {symptom_dx[0].upper()}\n"
+        
+        # Detailed probabilities table
+        explanation += "\n4. DETAILED PROBABILITIES\n\n"
+        explanation += f"   {'Condition':12s} {'AI':>8s} {'Symptoms':>10s} {'Combined':>10s}\n"
+        explanation += f"   {'-'*12} {'-'*8} {'-'*10} {'-'*10}\n"
+        
+        for condition in ['asthma', 'copd', 'pneumonia', 'bronchitis', 'healthy']:
+            condition_idx = MODEL_CLASSES.index(condition) if condition in MODEL_CLASSES else 0
+            ai_pct = ai_probs[condition_idx] * 100
+            sym_pct = symptom_probs.get(condition, 0) * 100
+            final_pct = final_probs.get(condition, 0) * 100
+            explanation += f"   {condition:12s} {ai_pct:7.1f}% {sym_pct:9.1f}% {final_pct:9.1f}%\n"
+        
+        return explanation
+
+# =============================================================================
+# CLINICAL ASSESSMENT WIDGET
+# =============================================================================
+
+class ClinicalAssessmentWidget(QFrame):
+    assessment_complete = Signal(dict)
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameStyle(QFrame.StyledPanel)
+        self.setStyleSheet("""
+            ClinicalAssessmentWidget {
+                background-color: #fff8e1;
+                border: 2px solid #ffb74d;
+                border-radius: 15px;
+                padding: 10px;
+            }
+        """)
+        self.assessment_data = {}
+        self._setup_ui()
+        self.hide()
+    
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        
+        title = QLabel("Clinical Assessment Questionnaire")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: #e65100;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        subtitle = QLabel("Please answer these questions based on your symptoms")
+        subtitle.setStyleSheet("font-size: 11px; color: #666;")
+        subtitle.setAlignment(Qt.AlignCenter)
+        layout.addWidget(subtitle)
+        
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border: none; background-color: transparent;")
+        
+        content_widget = QWidget()
+        self.form_layout = QVBoxLayout(content_widget)
+        self.form_layout.setSpacing(15)
+        
+        # Question 1: Breathing Difficulty
+        self._add_question("1. How would you describe your breathing difficulty?",
+                          ["No difficulty", "Mild - noticeable but not limiting",
+                           "Moderate - limits some activities", "Severe - difficulty at rest"],
+                          "breathing_difficulty")
+        
+        # Question 2: Chest Sensation
+        self._add_question("2. What chest sensations are you experiencing?",
+                          ["No chest discomfort", "Tightness (like a band squeezing)",
+                           "Sharp pain when breathing deeply", "Heavy or clogged feeling",
+                           "Rattling sensation when breathing"],
+                          "chest_sensation")
+        
+        # Question 3: Cough Type
+        self._add_question("3. What best describes your cough?",
+                          ["No cough", "Dry cough (no mucus)",
+                           "Productive cough with clear mucus",
+                           "Productive cough with yellow/green mucus",
+                           "Persistent cough that won't go away"],
+                          "cough_type")
+        
+        # Question 4: Sound Characteristic
+        self._add_question("4. What lung sounds did you notice?",
+                          ["Normal/No unusual sounds",
+                           "Wheezing (high-pitched whistling)",
+                           "Fine crackles (popping sounds)",
+                           "Coarse crackles/Rhonchi (rattling/bubbling)",
+                           "Rubbing/grating sound"],
+                          "lung_sounds")
+        
+        # Question 5: Systemic Symptoms (multi-select)
+        self._add_question("5. Do you have any of these symptoms? (Select all that apply)",
+                          ["Fever", "Chills", "Fatigue", "Weight loss", "Swollen ankles",
+                           "Sore throat", "Runny nose", "None of these"],
+                          "systemic_symptoms",
+                          multi_select=True)
+        
+        # Question 6: Symptom Pattern
+        self._add_question("6. When do symptoms typically occur?",
+                          ["Constant (always present)",
+                           "Episodic (comes and goes)",
+                           "Worse at night",
+                           "Triggered by exercise/allergens",
+                           "Worse when lying down"],
+                          "symptom_pattern")
+        
+        self.submit_btn = QPushButton("SUBMIT ASSESSMENT")
+        self.submit_btn.setMinimumHeight(40)
+        self.submit_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 14px;
+                font-weight: bold;
+                background: #ff9800;
+                color: white;
+                border: none;
+                border-radius: 10px;
+                padding: 8px;
+                margin-top: 10px;
+            }
+            QPushButton:hover { background: #f57c00; }
+        """)
+        self.submit_btn.clicked.connect(self._on_submit)
+        self.form_layout.addWidget(self.submit_btn)
+        
+        scroll.setWidget(content_widget)
+        layout.addWidget(scroll)
+    
+    def _add_question(self, question, options, key, multi_select=False):
+        """Add a question to the form"""
+        group = QGroupBox(question)
+        group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 10px; }")
+        layout = QVBoxLayout(group)
+        
+        if multi_select:
+            buttons = []
+            for option in options:
+                cb = QCheckBox(option)
+                layout.addWidget(cb)
+                buttons.append(cb)
+            self.assessment_data[key] = buttons
+        else:
+            button_group = QButtonGroup()
+            for i, option in enumerate(options):
+                rb = QRadioButton(option)
+                layout.addWidget(rb)
+                button_group.addButton(rb, i)
+            self.assessment_data[key] = button_group
+        
+        self.form_layout.addWidget(group)
+    
+    def _on_submit(self):
+        """Collect and emit assessment results"""
+        results = {}
+        
+        # Breathing difficulty
+        if "breathing_difficulty" in self.assessment_data:
+            bg = self.assessment_data["breathing_difficulty"]
+            selected = bg.checkedButton()
+            if selected:
+                results["breathing_difficulty"] = selected.text()
+        
+        # Chest sensation
+        if "chest_sensation" in self.assessment_data:
+            bg = self.assessment_data["chest_sensation"]
+            selected = bg.checkedButton()
+            if selected:
+                results["chest_sensation"] = selected.text()
+        
+        # Cough type
+        if "cough_type" in self.assessment_data:
+            bg = self.assessment_data["cough_type"]
+            selected = bg.checkedButton()
+            if selected:
+                results["cough_type"] = selected.text()
+        
+        # Lung sounds
+        if "lung_sounds" in self.assessment_data:
+            bg = self.assessment_data["lung_sounds"]
+            selected = bg.checkedButton()
+            if selected:
+                results["lung_sounds"] = selected.text()
+        
+        # Systemic symptoms (multi-select)
+        if "systemic_symptoms" in self.assessment_data:
+            selected = []
+            for cb in self.assessment_data["systemic_symptoms"]:
+                if cb.isChecked():
+                    selected.append(cb.text())
+            results["systemic_symptoms"] = selected
+        
+        # Symptom pattern
+        if "symptom_pattern" in self.assessment_data:
+            bg = self.assessment_data["symptom_pattern"]
+            selected = bg.checkedButton()
+            if selected:
+                results["symptom_pattern"] = selected.text()
+        
+        self.assessment_complete.emit(results)
+        self.hide()
+    
+    def show_assessment(self):
+        """Show the assessment widget and reset selections"""
+        for key, widget in self.assessment_data.items():
+            if isinstance(widget, list):
+                for cb in widget:
+                    cb.setChecked(False)
+            else:
+                widget.setExclusive(False)
+                for btn in widget.buttons():
+                    btn.setAutoExclusive(False)
+                    btn.setChecked(False)
+                widget.setExclusive(True)
+        
+        self.show()
+        self.raise_()
 
 # =============================================================================
 # TUMOR LOCALIZER CLASS
 # =============================================================================
 
 class TumorLocalizer:
-    """Localize tumors using path attenuation analysis and image reconstruction"""
+    """Localize tumors using path attenuation analysis"""
     
     def __init__(self):
         self.antenna_positions = ANTENNA_POSITIONS
@@ -297,7 +778,7 @@ class TumorLocalizer:
         return (x1, y1, x2, y2)
 
 # =============================================================================
-# RECONSTRUCTION WIDGET WITH PHASE AND BOUNDING BOX
+# RECONSTRUCTION WIDGET
 # =============================================================================
 
 class ReconstructionWidget(QWidget):
@@ -305,27 +786,23 @@ class ReconstructionWidget(QWidget):
         super().__init__(parent)
         self.setMinimumSize(350, 350)
         self.reconstruction_data = None
-        self.heatmap_data = None
         self.tumor_location = None
         self.bounding_box = None
         self.localization_confidence = 0
         self.setStyleSheet("background-color: white; border: 2px solid #4fc3f7; border-radius: 10px;")
     
-    def reconstruct_image_with_phase(self, s21_complex_data, frequencies, baseline_complex_data=None):
-        """
-        Phase-based coherent reconstruction for sharper images
-        s21_complex_data: dict of path_num -> complex numpy array
-        """
+    def reconstruct_image(self, s21_data, frequencies, baseline_data=None):
+        """Simple delay-and-sum reconstruction using magnitude data"""
         try:
             grid_size = 80
             x_grid = np.linspace(-100, 100, grid_size)
             y_grid = np.linspace(-100, 100, grid_size)
             X, Y = np.meshgrid(x_grid, y_grid)
             
-            image_complex = np.zeros((grid_size, grid_size), dtype=np.complex64)
-            c = 3e8  # speed of light in m/s
+            image = np.zeros((grid_size, grid_size))
+            c = 3e8
             
-            for path_num, s21 in s21_complex_data.items():
+            for path_num, s21 in s21_data.items():
                 if path_num not in PATH_TO_ANTENNA_PAIR:
                     continue
                 
@@ -333,9 +810,12 @@ class ReconstructionWidget(QWidget):
                 tx_pos = ANTENNA_POSITIONS[tx_ant]
                 rx_pos = ANTENNA_POSITIONS[rx_ant]
                 
-                # Subtract baseline in complex domain if available
-                if baseline_complex_data and path_num in baseline_complex_data:
-                    s21 = s21 - baseline_complex_data[path_num]
+                # Convert dB to linear
+                s21_linear = db_to_linear(s21)
+                
+                if baseline_data and path_num in baseline_data:
+                    baseline_linear = db_to_linear(baseline_data[path_num])
+                    s21_linear = s21_linear - baseline_linear
                 
                 for i in range(grid_size):
                     for j in range(grid_size):
@@ -343,43 +823,33 @@ class ReconstructionWidget(QWidget):
                         
                         d_tx = np.sqrt((tx_pos[0] - point[0])**2 + (tx_pos[1] - point[1])**2)
                         d_rx = np.sqrt((rx_pos[0] - point[0])**2 + (rx_pos[1] - point[1])**2)
-                        total_dist = (d_tx + d_rx) / 1000  # Convert to meters
+                        total_dist = (d_tx + d_rx) / 1000
                         
-                        # Coherent summation across frequencies
-                        for f_idx, freq in enumerate(frequencies):
-                            omega = 2 * np.pi * freq * 1e9
-                            phase_shift = np.exp(-1j * omega * total_dist / c)
-                            image_complex[i, j] += s21[f_idx] * phase_shift
+                        # Simple delay compensation (magnitude-based)
+                        delay = total_dist / c
+                        freq_idx = int(np.clip(delay * 1e9 / (STOP_FREQ/1e9) * POINTS, 0, POINTS-1))
+                        
+                        if freq_idx < len(s21_linear):
+                            image[i, j] += s21_linear[freq_idx]
             
-            # Normalize
-            image_complex /= len(s21_complex_data) * len(frequencies)
+            image /= len(s21_data)
+            image = gaussian_filter(image, sigma=2)
             
-            # Take magnitude for display
-            magnitude = np.abs(image_complex)
+            # Normalize for display
+            if image.max() > 0:
+                image = np.clip(image, 0, np.percentile(image, 95))
+                image = (image / image.max()) * 255
             
-            # Apply Gaussian filter for smoothing
-            magnitude = gaussian_filter(magnitude, sigma=1.5)
-            
-            # Clip to 95th percentile for better contrast
-            magnitude = np.clip(magnitude, 0, np.percentile(magnitude, 95))
-            
-            # Normalize to 0-255
-            if magnitude.max() > 0:
-                magnitude = (magnitude / magnitude.max()) * 255
-            
-            self.reconstruction_data = magnitude.astype(np.uint8)
-            self.heatmap_data = magnitude.astype(np.uint8)
+            self.reconstruction_data = image.astype(np.uint8)
             self.update()
-            
-            return self.reconstruction_data, image_complex
+            return self.reconstruction_data
             
         except Exception as e:
-            print(f"Phase reconstruction error: {e}")
+            print(f"Reconstruction error: {e}")
             traceback.print_exc()
-            return None, None
+            return None
     
     def set_tumor_localization(self, tumor_location, confidence, bounding_box):
-        """Set tumor localization data for visualization"""
         self.tumor_location = tumor_location
         self.localization_confidence = confidence
         self.bounding_box = bounding_box
@@ -399,11 +869,9 @@ class ReconstructionWidget(QWidget):
             scale_x = w / img_width
             scale_y = h / img_height
             
-            # Draw heatmap
             for i in range(img_width):
                 for j in range(img_height):
                     val = self.reconstruction_data[i, j]
-                    # Use colormap: blue (low) -> red (high)
                     r = int(val)
                     g = int(val * 0.5)
                     b = int(255 - val)
@@ -412,22 +880,17 @@ class ReconstructionWidget(QWidget):
                     y = int(j * scale_y)
                     painter.fillRect(x, y, int(scale_x) + 1, int(scale_y) + 1, color)
             
-            # Draw bounding box if tumor detected with good confidence
             if self.bounding_box and self.localization_confidence > 0.5:
                 x1, y1, x2, y2 = self.bounding_box
-                
-                # Draw red bounding box
                 painter.setPen(QPen(QColor(255, 0, 0), 3))
                 painter.drawRect(x1, y1, x2 - x1, y2 - y1)
                 
-                # Draw crosshair at center
                 center_x = (x1 + x2) // 2
                 center_y = (y1 + y2) // 2
                 painter.setPen(QPen(QColor(255, 0, 0), 2))
                 painter.drawLine(center_x - 10, center_y, center_x + 10, center_y)
                 painter.drawLine(center_x, center_y - 10, center_x, center_y + 10)
                 
-                # Draw confidence label background
                 painter.setPen(QPen(QColor(0, 0, 0), 1))
                 painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
                 painter.drawRect(x1, y1 - 25, 120, 20)
@@ -438,7 +901,6 @@ class ReconstructionWidget(QWidget):
             painter.drawRect(10, 10, w - 20, h - 20)
             painter.drawText(w//2 - 100, h//2, "Reconstruction will appear here after scan")
         
-        # Draw antenna positions
         painter.setPen(QPen(QColor(0, 0, 255), 3))
         painter.setBrush(QBrush(QColor(0, 0, 255)))
         for ant, pos in ANTENNA_POSITIONS.items():
@@ -450,16 +912,14 @@ class ReconstructionWidget(QWidget):
         painter.end()
     
     def clear(self):
-        """Clear reconstruction data"""
         self.reconstruction_data = None
-        self.heatmap_data = None
         self.tumor_location = None
         self.bounding_box = None
         self.localization_confidence = 0
         self.update()
 
 # =============================================================================
-# AUDIO PROCESSOR WITH YAMNET
+# AUDIO PROCESSOR
 # =============================================================================
 
 class AudioProcessor(QThread):
@@ -484,7 +944,7 @@ class AudioProcessor(QThread):
             
             self.yamnet_interpreter = tflite.Interpreter(str(YAMNET_PATH))
             self.yamnet_interpreter.allocate_tensors()
-            print("✅ YAMNet TFLite loaded")
+            print("YAMNet TFLite loaded")
             
             if not AUDIO_MODEL_PATH.exists():
                 self.error_occurred.emit(f"Classifier not found: {AUDIO_MODEL_PATH}")
@@ -492,7 +952,7 @@ class AudioProcessor(QThread):
             
             self.classifier_interpreter = tflite.Interpreter(str(AUDIO_MODEL_PATH))
             self.classifier_interpreter.allocate_tensors()
-            print("✅ Classifier loaded")
+            print("Classifier loaded")
             
         except Exception as e:
             self.error_occurred.emit(f"Model loading error: {e}")
@@ -568,7 +1028,7 @@ class AudioProcessor(QThread):
             self.finished.emit()
 
 # =============================================================================
-# EDUCATIONAL WIDGET
+# EDUCATIONAL WIDGET (Fixed Scrolling)
 # =============================================================================
 
 class EducationalWidget(QFrame):
@@ -602,48 +1062,96 @@ class EducationalWidget(QFrame):
         
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("border: none; background-color: transparent;")
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #f0f0f0;
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #4fc3f7;
+                min-height: 20px;
+                border-radius: 5px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
         
         content_widget = QWidget()
         self.content_layout = QVBoxLayout(content_widget)
         self.content_layout.setSpacing(15)
+        self.content_layout.setContentsMargins(10, 10, 10, 10)
         
         self.condition_label = QLabel()
-        self.condition_label.setStyleSheet("font-size: 20px; font-weight: bold;")
+        self.condition_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #0277bd;")
         self.condition_label.setAlignment(Qt.AlignCenter)
+        self.condition_label.setWordWrap(True)
         self.content_layout.addWidget(self.condition_label)
         
         self.desc_label = QLabel()
         self.desc_label.setWordWrap(True)
-        self.desc_label.setStyleSheet("font-size: 13px; line-height: 1.5;")
+        self.desc_label.setStyleSheet("font-size: 13px; line-height: 1.5; padding: 5px;")
+        self.desc_label.setAlignment(Qt.AlignTop)
         self.content_layout.addWidget(self.desc_label)
         
         signs_group = QGroupBox("Clinical Signs and Symptoms")
         signs_group.setStyleSheet("""
-            QGroupBox { font-size: 14px; font-weight: bold; border: 1px solid #ccc; border-radius: 8px; margin-top: 10px; padding-top: 10px; }
+            QGroupBox { 
+                font-size: 14px; 
+                font-weight: bold; 
+                border: 1px solid #ccc; 
+                border-radius: 8px; 
+                margin-top: 10px; 
+                padding-top: 10px;
+            }
         """)
         signs_layout = QVBoxLayout(signs_group)
         self.signs_label = QLabel()
         self.signs_label.setWordWrap(True)
-        self.signs_label.setStyleSheet("font-size: 12px;")
+        self.signs_label.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.signs_label.setAlignment(Qt.AlignTop)
         signs_layout.addWidget(self.signs_label)
         self.content_layout.addWidget(signs_group)
         
         rec_group = QGroupBox("Recommendations")
         rec_group.setStyleSheet("""
-            QGroupBox { font-size: 14px; font-weight: bold; border: 1px solid #ccc; border-radius: 8px; margin-top: 10px; padding-top: 10px; }
+            QGroupBox { 
+                font-size: 14px; 
+                font-weight: bold; 
+                border: 1px solid #ccc; 
+                border-radius: 8px; 
+                margin-top: 10px; 
+                padding-top: 10px;
+            }
         """)
         rec_layout = QVBoxLayout(rec_group)
         self.rec_label = QLabel()
         self.rec_label.setWordWrap(True)
-        self.rec_label.setStyleSheet("font-size: 12px;")
+        self.rec_label.setStyleSheet("font-size: 12px; padding: 5px;")
+        self.rec_label.setAlignment(Qt.AlignTop)
         rec_layout.addWidget(self.rec_label)
         self.content_layout.addWidget(rec_group)
         
-        literacy_note = QLabel("Clinical literacy empowers patients to recognize symptoms early and seek appropriate care.")
+        literacy_note = QLabel(
+            "Clinical literacy empowers patients to recognize symptoms early and seek appropriate care."
+        )
         literacy_note.setWordWrap(True)
-        literacy_note.setStyleSheet("font-size: 11px; font-style: italic; color: #666; background-color: #e3f2fd; padding: 8px; border-radius: 8px;")
+        literacy_note.setStyleSheet(
+            "font-size: 11px; font-style: italic; color: #666; "
+            "background-color: #e3f2fd; padding: 8px; border-radius: 8px;"
+        )
+        literacy_note.setAlignment(Qt.AlignTop)
         self.content_layout.addWidget(literacy_note)
+        
+        self.content_layout.addStretch()
         
         scroll.setWidget(content_widget)
         layout.addWidget(scroll)
@@ -661,7 +1169,7 @@ class EducationalWidget(QFrame):
         self.raise_()
 
 # =============================================================================
-# VNA CONTROLLER WITH COMPLEX DATA
+# VNA CONTROLLER
 # =============================================================================
 
 class VNADirectController:
@@ -684,11 +1192,11 @@ class VNADirectController:
             print(f"VNA connection failed: {e}")
             return False
     
-    def capture_s21_complex(self, progress_callback=None):
-        """Capture complex S21 data (real and imaginary parts)"""
+    def capture_s21(self, progress_callback=None):
+        """Capture S21 magnitude data"""
         if not self.serial_conn or not self.serial_conn.is_open:
             if not self.connect():
-                return None, None
+                return None
         
         try:
             self.serial_conn.reset_input_buffer()
@@ -699,8 +1207,7 @@ class VNADirectController:
             
             time.sleep(2.0)
             
-            real_parts = []
-            imag_parts = []
+            data_points = []
             lines_collected = 0
             timeout_start = time.time()
             max_timeout = 20
@@ -715,12 +1222,13 @@ class VNADirectController:
                     parts = line.split()
                     if len(parts) >= 3:
                         try:
-                            freq_hz = float(parts[0])
                             s21_real = float(parts[1])
                             s21_imag = float(parts[2])
                             
-                            real_parts.append(s21_real)
-                            imag_parts.append(s21_imag)
+                            magnitude = math.sqrt(s21_real**2 + s21_imag**2)
+                            magnitude_db = 20 * math.log10(magnitude) if magnitude > 0 else -120
+                            
+                            data_points.append(magnitude_db)
                             lines_collected += 1
                             
                             if progress_callback and lines_collected % 20 == 0:
@@ -730,17 +1238,17 @@ class VNADirectController:
                 else:
                     time.sleep(0.05)
             
-            if len(real_parts) == POINTS:
+            if len(data_points) == POINTS:
                 if self.frequencies is None:
                     self.frequencies = np.linspace(START_FREQ/1e9, STOP_FREQ/1e9, POINTS)
-                return np.array(real_parts), np.array(imag_parts)
+                return np.array(data_points)
             else:
-                print(f"Only {len(real_parts)}/{POINTS} points captured")
-                return None, None
+                print(f"Only {len(data_points)}/{POINTS} points captured")
+                return None
                 
         except Exception as e:
             print(f"VNA capture error: {e}")
-            return None, None
+            return None
     
     def close(self):
         if self.serial_conn and self.serial_conn.is_open:
@@ -786,37 +1294,36 @@ class CSVDataManager:
         BASELINE_DIR.mkdir(parents=True, exist_ok=True)
         PATIENT_DIR.mkdir(parents=True, exist_ok=True)
         MULTI_ANGLE_DIR.mkdir(parents=True, exist_ok=True)
-        print(f"Data directories created")
+        print("Data directories created")
     
-    def save_scan_complex(self, real_data, imag_data, path_num, directory, frequencies=None, angle=0):
+    def save_scan(self, data, path_num, directory, frequencies=None, angle=0):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         filename = f"path{path_num}_angle{angle}_{timestamp}.csv"
         filepath = directory / filename
         
         if frequencies is None:
-            frequencies = np.linspace(START_FREQ/1e9, STOP_FREQ/1e9, len(real_data))
+            frequencies = np.linspace(START_FREQ/1e9, STOP_FREQ/1e9, len(data))
         
         rows = []
-        for i, (freq, real, imag) in enumerate(zip(frequencies, real_data, imag_data)):
-            rows.append([freq, real, imag])
+        for i, (freq, s21) in enumerate(zip(frequencies, data)):
+            rows.append([freq, s21])
         
         with open(filepath, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(['Frequency_GHz', 'S21_real', 'S21_imag'])
+            writer.writerow(['Frequency_GHz', 'S21_dB'])
             writer.writerows(rows)
         
         return filepath
     
-    def load_complex_from_directory(self, directory):
-        """Load all complex data from a directory"""
-        complex_data = {}
+    def load_latest_from_directory(self, directory):
+        data = {}
         for path_num in [1, 2, 3, 4]:
             files = list(directory.glob(f"path{path_num}_*.csv"))
             if files:
                 latest = max(files, key=lambda f: f.stat().st_mtime)
                 df = pd.read_csv(latest)
-                complex_data[path_num] = df['S21_real'].values + 1j * df['S21_imag'].values
-        return complex_data if complex_data else None
+                data[path_num] = df['S21_dB'].values
+        return data if data else None
     
     def has_baseline(self):
         for path_num in [1, 2, 3, 4]:
@@ -833,7 +1340,7 @@ class CSVDataManager:
         print("All data cleared")
 
 # =============================================================================
-# MICROWAVE SCANNER WITH MULTI-ANGLE SUPPORT
+# MICROWAVE SCANNER
 # =============================================================================
 
 class MicrowaveScanner:
@@ -842,18 +1349,16 @@ class MicrowaveScanner:
         self.switch = RFSwitchController()
         self.csv_manager = CSVDataManager()
         self.frequencies = None
-        self._baseline_complex = None
-        self._last_complex_data = None
+        self._baseline_data = None
     
-    def scan_all_paths_complex(self, save_dir, angle=0, progress_callback=None):
-        """Scan all paths and return complex data"""
-        data_complex = {}
-        data_mag_db = {}
+    def scan_all_paths(self, save_dir, angle=0, progress_callback=None):
+        """Scan all paths and return magnitude data"""
+        data = {}
         total_paths = len(PATHS)
         
         for idx, path_num in enumerate(PATHS.keys(), 1):
             if progress_callback:
-                progress_callback(f"Setting Path {path_num} at {angle}°", idx / total_paths)
+                progress_callback(f"Setting Path {path_num} at {angle} deg", idx / total_paths)
             
             self.switch.set_path(path_num)
             time.sleep(0.2)
@@ -861,41 +1366,72 @@ class MicrowaveScanner:
             if progress_callback:
                 progress_callback(f"Capturing Path {path_num}", idx / total_paths)
             
-            real_data, imag_data = self.vna.capture_s21_complex()
-            if real_data is None:
+            s21_data = self.vna.capture_s21()
+            if s21_data is None:
                 raise RuntimeError(f"Failed to capture path {path_num}")
             
-            complex_data = real_data + 1j * imag_data
-            data_complex[path_num] = complex_data
-            data_mag_db[path_num] = 20 * np.log10(np.abs(complex_data) + 1e-12)
+            data[path_num] = s21_data
             
             if self.frequencies is None:
                 self.frequencies = self.vna.frequencies
             
-            self.csv_manager.save_scan_complex(real_data, imag_data, path_num, save_dir, self.frequencies, angle)
+            self.csv_manager.save_scan(s21_data, path_num, save_dir, self.frequencies, angle)
             
             if progress_callback:
                 progress_callback(f"Path {path_num} complete", idx / total_paths)
         
-        return data_complex, data_mag_db
+        return data
     
-    def set_baseline(self, baseline_complex):
-        self._baseline_complex = baseline_complex.copy()
-        print(f"Baseline stored for {len(self._baseline_complex)} paths")
+    def set_baseline(self, baseline_data):
+        self._baseline_data = baseline_data.copy()
+        print(f"Baseline stored for {len(self._baseline_data)} paths")
     
     def load_baseline(self):
-        if self._baseline_complex is not None:
-            return self._baseline_complex
-        return self.csv_manager.load_complex_from_directory(BASELINE_DIR)
+        if self._baseline_data is not None:
+            return self._baseline_data
+        return self.csv_manager.load_latest_from_directory(BASELINE_DIR)
     
     def has_baseline(self):
-        return self.csv_manager.has_baseline() or (self._baseline_complex is not None)
+        return self.csv_manager.has_baseline() or (self._baseline_data is not None)
     
-    def extract_features_from_complex(self, complex_data):
-        """Extract features from complex data (magnitude only for ML consistency)"""
-        magnitude = [np.abs(complex_data[p]) for p in [1, 2, 3, 4]]
-        raw = np.array(magnitude).reshape(1, -1)
-        return add_time_domain_features(raw)[0]
+    def extract_features(self, s21_data):
+        """
+        Extract 840-dim feature vector from magnitude data.
+        This matches your training pipeline exactly.
+        """
+        # Step 1: Concatenate frequency features (4 paths * 201 points = 804)
+        freq_features = np.array([s21_data[p] for p in [1, 2, 3, 4]]).reshape(1, -1)
+        
+        # Step 2: Add time-domain features (36 features)
+        augmented_features = add_time_domain_features(freq_features)
+        
+        return augmented_features[0]
+    
+    def combine_rotation_features(self, rotation_data):
+        """
+        Combine features from multiple rotations by AVERAGING.
+        This maintains the 840-dim feature vector your model expects.
+        
+        Args:
+            rotation_data: dict of {angle: {path_num: s21_array}}
+        
+        Returns:
+            840-dim feature vector (averaged across rotations)
+        """
+        all_freq_features = []
+        
+        for angle, data in rotation_data.items():
+            # Extract frequency features for this rotation
+            freq_features = np.array([data[p] for p in [1, 2, 3, 4]]).reshape(1, -1)
+            all_freq_features.append(freq_features)
+        
+        # Average across all rotations (preserves 804 dimensions)
+        avg_freq_features = np.mean(all_freq_features, axis=0)  # Shape: (1, 804)
+        
+        # Add time-domain features (36 features)
+        augmented_features = add_time_domain_features(avg_freq_features)
+        
+        return augmented_features[0]
     
     def cleanup(self):
         self.switch.cleanup()
@@ -919,6 +1455,7 @@ class FusionClassifier:
         print("Fusion model loaded")
     
     def predict(self, mw_features, audio_probs):
+        """Combine 840-dim microwave features + 5-dim audio probs = 845-dim"""
         fusion_vec = np.concatenate([mw_features, audio_probs]).reshape(1, -1)
         scaled = self.scaler.transform(fusion_vec)
         pred = self.model.predict(scaled)[0]
@@ -942,6 +1479,9 @@ class PulmoAIMainWindow(QMainWindow):
         
         self.educational_widget = EducationalWidget(self)
         self.reconstruction_widget = ReconstructionWidget(self)
+        self.clinical_assessment = ClinicalAssessmentWidget(self)
+        self.clinical_assessment.assessment_complete.connect(self._on_clinical_assessment)
+        self.clinical_decision_support = EnhancedClinicalDecisionSupport()
         
         try:
             self.fusion = FusionClassifier()
@@ -951,9 +1491,10 @@ class PulmoAIMainWindow(QMainWindow):
         
         self.current_mw_features = None
         self.current_audio_probs = None
-        self.current_complex_data = None
-        self.baseline_complex = None
-        self.rotation_scans = {}  # Store scans at different angles
+        self.last_ai_probs = None
+        self.current_s21_data = None
+        self.baseline_data = None
+        self.rotation_scans = {}
         
         self._setup_ui()
         self.showFullScreen()
@@ -1066,7 +1607,7 @@ class PulmoAIMainWindow(QMainWindow):
         right_layout.setContentsMargins(5, 10, 5, 10)
         right_layout.setSpacing(15)
         
-        recon_title = QLabel("Microwave Reconstruction (Phase-Based)")
+        recon_title = QLabel("Microwave Reconstruction")
         recon_title.setAlignment(Qt.AlignCenter)
         recon_title.setStyleSheet("font-size: 14px; font-weight: bold; color: #0277bd;")
         right_layout.addWidget(recon_title)
@@ -1074,6 +1615,7 @@ class PulmoAIMainWindow(QMainWindow):
         self.reconstruction_widget.setMinimumHeight(300)
         right_layout.addWidget(self.reconstruction_widget)
         
+        right_layout.addWidget(self.clinical_assessment)
         right_layout.addWidget(self.educational_widget)
         
         mission = QLabel("""
@@ -1155,7 +1697,7 @@ class PulmoAIMainWindow(QMainWindow):
         
         self.audio_result = QTextEdit()
         self.audio_result.setReadOnly(True)
-        self.audio_result.setMinimumHeight(180)
+        self.audio_result.setMinimumHeight(250)
         self.audio_result.setStyleSheet("font-size: 12px;")
         layout.addWidget(self.audio_result)
         
@@ -1274,10 +1816,11 @@ class PulmoAIMainWindow(QMainWindow):
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply == QMessageBox.Yes:
             self.scanner.csv_manager.clear_all()
-            self.scanner._baseline_complex = None
+            self.scanner._baseline_data = None
             self.current_mw_features = None
             self.current_audio_probs = None
-            self.current_complex_data = None
+            self.last_ai_probs = None
+            self.current_s21_data = None
             self.rotation_scans = {}
             self.reconstruction_widget.clear()
             self.mw_result.setText("All data cleared. You can now record a new baseline.")
@@ -1297,15 +1840,15 @@ class PulmoAIMainWindow(QMainWindow):
         
         def worker():
             try:
-                data_complex, data_mag = self.scanner.scan_all_paths_complex(
+                data = self.scanner.scan_all_paths(
                     BASELINE_DIR, angle=0,
                     progress_callback=lambda msg, f: self._update_mw_progress(msg, f)
                 )
-                self.scanner.set_baseline(data_complex)
-                self.baseline_complex = data_complex
+                self.scanner.set_baseline(data)
+                self.baseline_data = data
                 
-                result_text = f"BASELINE RECORDED SUCCESSFULLY\n\n"
-                result_text += "Complex baseline data saved.\n"
+                result_text = "BASELINE RECORDED SUCCESSFULLY\n\n"
+                result_text += "Baseline data saved.\n"
                 result_text += f"\nFiles saved to: {BASELINE_DIR}\n"
                 result_text += "\nNow place patient between antennas and click SCAN PATIENT (MULTI-ANGLE)."
                 
@@ -1323,7 +1866,7 @@ class PulmoAIMainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
     
     def _run_multi_angle_scan(self):
-        """Perform scans at multiple rotation angles with user prompts"""
+        """Perform scans at multiple rotation angles and combine via averaging"""
         if not self.vna.serial_conn:
             QMessageBox.warning(self, "VNA Error", "VNA not connected.")
             return
@@ -1338,99 +1881,91 @@ class PulmoAIMainWindow(QMainWindow):
         
         def worker():
             try:
-                all_complex_data = {}
-                all_mag_data = {}
+                all_rotation_data = {}
+                baseline = self.scanner.load_baseline()
                 
                 for angle_idx, angle in enumerate(ROTATION_ANGLES):
-                    # Update UI for this angle
-                    self.mw_status.setText(f"Scanning at {angle}° rotation...")
+                    self.mw_status.setText(f"Scanning at {angle} deg rotation...")
                     self.mw_progress.setValue(int(angle_idx / len(ROTATION_ANGLES) * 50))
                     
-                    # Prompt user to rotate
                     if angle_idx > 0:
-                        self.mw_result.setText(f"Please rotate the phantom to {angle}° and click OK")
-                        # Note: In a real app, you'd use a dialog here
-                        # For now, we'll just wait 3 seconds
-                        time.sleep(3)
+                        # In production, use a dialog. For now, auto-continue with delay
+                        time.sleep(2)
                     
-                    # Scan at this angle
-                    data_complex, data_mag = self.scanner.scan_all_paths_complex(
+                    data = self.scanner.scan_all_paths(
                         MULTI_ANGLE_DIR, angle=angle,
                         progress_callback=lambda msg, f: self._update_mw_progress(msg, f)
                     )
                     
-                    all_complex_data[angle] = data_complex
-                    all_mag_data[angle] = data_mag
+                    all_rotation_data[angle] = data
+                    
+                    # Reconstruct image for this rotation
+                    self.reconstruction_widget.reconstruct_image(data, self.scanner.frequencies, baseline)
                     
                     self.mw_progress.setValue(int((angle_idx + 1) / len(ROTATION_ANGLES) * 50))
                 
-                self.rotation_scans = all_complex_data
-                self.current_complex_data = all_complex_data
+                self.rotation_scans = all_rotation_data
                 
-                # Combine features from all rotations
-                combined_features = self._combine_rotation_features(all_mag_data)
+                # COMBINE FEATURES BY AVERAGING ACROSS ROTATIONS
+                # This preserves the 840-dim feature vector
+                combined_features = self.scanner.combine_rotation_features(all_rotation_data)
                 self.current_mw_features = combined_features
                 
-                # Reconstruct image using all rotations (phase-based)
-                self._reconstruct_from_rotations(all_complex_data)
+                # Final reconstruction using averaged data
+                self._reconstruct_from_rotations(all_rotation_data)
                 
-                # Generate localization analysis
-                baseline = self.scanner.load_baseline()
+                # Generate localization analysis using averaged data
                 localizer = TumorLocalizer()
                 
-                # Combine attenuation across rotations
+                # Average attenuation across rotations for localization
                 combined_attenuation = {}
-                for angle, data in all_mag_data.items():
+                for angle, data in all_rotation_data.items():
                     analysis = localizer.analyze_path_attenuation(data, baseline)
                     for path, atten in analysis['path_attenuation'].items():
                         if path not in combined_attenuation:
                             combined_attenuation[path] = []
                         combined_attenuation[path].append(atten)
                 
-                # Average across rotations
                 avg_attenuation = {p: np.mean(v) for p, v in combined_attenuation.items()}
                 sorted_paths = sorted(avg_attenuation.items(), key=lambda x: x[1], reverse=True)
                 
                 tumor_location = localizer._estimate_location_from_paths(sorted_paths)
                 confidence = localizer._calculate_confidence(sorted_paths, {})
                 
-                # Generate bounding box
                 w = self.reconstruction_widget.width()
                 h = self.reconstruction_widget.height()
                 bounding_box = localizer.generate_bounding_box(tumor_location, w, h)
                 
-                # Update reconstruction widget with localization
                 self.reconstruction_widget.set_tumor_localization(tumor_location, confidence, bounding_box)
                 
-                # Format result text
-                result_text = f"MULTI-ANGLE PATIENT SCAN COMPLETE\n\n"
+                result_text = "MULTI-ANGLE PATIENT SCAN COMPLETE\n\n"
                 result_text += f"Scanned at angles: {ROTATION_ANGLES}\n"
-                result_text += f"Total transmission paths: {len(ROTATION_ANGLES) * 4}\n\n"
+                result_text += f"Total transmission paths: {len(ROTATION_ANGLES) * 4}\n"
+                result_text += f"Features combined via averaging to maintain 840-dim vector\n\n"
                 
-                result_text += f"TUMOR LOCALIZATION:\n"
+                result_text += "TUMOR LOCALIZATION:\n"
                 if confidence > 0.5:
                     result_text += f"   Location: {tumor_location['description']}\n"
                     result_text += f"   Coordinates: ({tumor_location['x']:.0f} mm, {tumor_location['y']:.0f} mm)\n"
                     result_text += f"   Confidence: {confidence:.0%}\n\n"
-                    result_text += f"   Most affected paths (averaged across rotations):\n"
+                    result_text += "   Most affected paths (averaged across rotations):\n"
                     for path_num, attenuation in sorted_paths[:2]:
                         result_text += f"     Path {path_num}: {attenuation:.1f} dB attenuation\n"
-                    result_text += f"\nClinical Interpretation:\n"
+                    result_text += "\nCLINICAL INTERPRETATION:\n"
                     result_text += f"   The model identifies an abnormal presence in the {tumor_location['quadrant']} quadrant.\n"
-                    result_text += f"   This area shows increased attenuation compared to baseline,\n"
-                    result_text += f"   suggesting potential tissue abnormality.\n"
-                    result_text += f"   Recommended: Further clinical correlation advised.\n"
+                    result_text += "   This area shows increased attenuation compared to baseline,\n"
+                    result_text += "   suggesting potential tissue abnormality.\n"
+                    result_text += "   Recommended: Further clinical correlation advised.\n"
                 else:
-                    result_text += f"   No significant abnormality detected (confidence: {confidence:.0%})\n"
-                    result_text += f"   Multi-angle scan appears within normal baseline range.\n"
+                    result_text += "   No significant abnormality detected\n"
+                    result_text += f"   Confidence: {confidence:.0%}\n"
                 
                 result_text += f"\nData saved to: {MULTI_ANGLE_DIR}\n"
-                result_text += f"\nReady for fusion with acoustic analysis."
+                result_text += "\nReady for fusion with acoustic analysis."
                 
                 self.mw_result.setText(result_text)
                 self.mw_status.setText("Multi-angle scan complete")
                 
-                # Enable fusion buttons
                 if self.fusion is not None:
                     self.fusion_audio_btn.setEnabled(True)
                 
@@ -1444,46 +1979,30 @@ class PulmoAIMainWindow(QMainWindow):
         
         threading.Thread(target=worker, daemon=True).start()
     
-    def _combine_rotation_features(self, rotation_mag_data):
-        """Combine magnitude features from multiple rotations"""
-        all_raw_features = []
-        
-        for angle, data in rotation_mag_data.items():
-            raw = np.array([data[p] for p in [1, 2, 3, 4]]).reshape(1, -1)
-            all_raw_features.append(raw)
-        
-        combined = np.concatenate(all_raw_features, axis=1)
-        return add_time_domain_features(combined)[0]
-    
-    def _reconstruct_from_rotations(self, rotation_complex_data):
-        """Reconstruct image using phase-based method from all rotations"""
+    def _reconstruct_from_rotations(self, rotation_data):
+        """Reconstruct image using averaged data from all rotations"""
         try:
-            # Combine complex data from all rotations
-            all_complex = {}
-            for angle, data in rotation_complex_data.items():
-                for path_num, complex_val in data.items():
-                    if path_num not in all_complex:
-                        all_complex[path_num] = []
-                    all_complex[path_num].append(complex_val)
+            # Average S21 data across all rotations
+            avg_s21 = {p: [] for p in [1, 2, 3, 4]}
             
-            # Average complex data across rotations
-            avg_complex = {}
-            for path_num, values in all_complex.items():
-                avg_complex[path_num] = np.mean(np.array(values), axis=0)
+            for angle, data in rotation_data.items():
+                for path_num in [1, 2, 3, 4]:
+                    if path_num in data:
+                        avg_s21[path_num].append(data[path_num])
+            
+            # Compute average for each path
+            for path_num in avg_s21:
+                if avg_s21[path_num]:
+                    avg_s21[path_num] = np.mean(avg_s21[path_num], axis=0)
+                else:
+                    avg_s21[path_num] = np.zeros(POINTS)
             
             baseline = self.scanner.load_baseline()
-            
-            # Perform phase-based reconstruction
-            image, _ = self.reconstruction_widget.reconstruct_image_with_phase(
-                avg_complex, self.scanner.frequencies, baseline
-            )
-            
-            return image
+            self.reconstruction_widget.reconstruct_image(avg_s21, self.scanner.frequencies, baseline)
             
         except Exception as e:
             print(f"Rotation reconstruction error: {e}")
             traceback.print_exc()
-            return None
     
     def _run_acoustic_analysis(self):
         self.audio_btn.setEnabled(False)
@@ -1499,24 +2018,47 @@ class PulmoAIMainWindow(QMainWindow):
         self.audio_thread.start()
     
     def _on_audio_result(self, probs):
-        self.current_audio_probs = probs
+        self.last_ai_probs = probs
+        self.clinical_assessment.show_assessment()
+    
+    def _on_clinical_assessment(self, patient_symptoms):
+        """Handle completed clinical assessment with enhanced decision support"""
+        if self.last_ai_probs is None:
+            return
         
-        model_class_idx = np.argmax(probs)
-        confidence = probs[model_class_idx]
-        class_name = MODEL_CLASSES[model_class_idx]
+        environmental_quality = "normal"
         
-        self.educational_widget.show_condition(class_name, confidence)
+        final_dx, confidence, explanation, all_probs = self.clinical_decision_support.assess(
+            self.last_ai_probs, patient_symptoms, environmental_quality
+        )
         
-        result_text = f"ACOUSTIC DIAGNOSIS\n\n"
-        result_text += f"PREDICTION: {class_name.upper()}\n"
-        result_text += f"Confidence: {confidence:.1%}\n\n"
-        result_text += "Detailed Probabilities:\n"
-        for i, (c, p) in enumerate(zip(MODEL_CLASSES, probs)):
-            result_text += f"   {c}: {p:.1%}\n"
-        result_text += "\nClinical education content displayed on the right panel."
+        recommendations = {
+            'asthma': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Use prescribed rescue inhaler as needed\n   - Identify and avoid triggers\n   - Consider daily controller medication\n   - Create an asthma action plan\n",
+            'copd': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Smoking cessation (if applicable)\n   - Pulmonary rehabilitation\n   - Use prescribed bronchodilators\n   - Monitor oxygen saturation\n",
+            'pneumonia': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Seek medical evaluation promptly\n   - Antibiotics if bacterial cause confirmed\n   - Rest and hydration\n   - Follow-up chest X-ray\n",
+            'bronchitis': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Rest and increased fluid intake\n   - Honey or cough suppressants for symptom relief\n   - Avoid irritants (smoke, dust)\n   - See doctor if symptoms persist >3 weeks\n",
+            'healthy': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - No specific treatment needed\n   - Maintain healthy lifestyle\n   - Regular exercise and good nutrition\n   - Annual check-ups recommended\n"
+        }
+        
+        result_text = "PULMO AI CLINICAL ASSESSMENT\n\n"
+        result_text += explanation
+        result_text += recommendations.get(final_dx, "")
+        result_text += "\n\n" + "=" * 50 + "\n"
+        result_text += "DISCLAIMER: This is an AI-assisted screening tool.\n"
+        result_text += "Always consult a qualified healthcare provider for medical decisions."
         
         self.audio_result.setText(result_text)
-        self.audio_status.setText(f"Diagnosis: {class_name} ({confidence:.1%})")
+        self.audio_status.setText(f"Diagnosis: {final_dx.upper()} ({confidence:.1%})")
+        
+        self.educational_widget.show_condition(final_dx, confidence)
+        
+        # Store for fusion
+        final_probs = np.zeros(5)
+        for i, condition in enumerate(MODEL_CLASSES):
+            if condition in all_probs:
+                final_probs[i] = all_probs[condition]
+        
+        self.current_audio_probs = final_probs
         
         if self.current_mw_features is not None and self.fusion is not None:
             self.fusion_combine_btn.setEnabled(True)
@@ -1572,27 +2114,26 @@ class PulmoAIMainWindow(QMainWindow):
                     self.fusion_mw_btn.setEnabled(True)
                     return
                 
-                # Perform multi-angle scan
-                all_complex_data = {}
-                all_mag_data = {}
+                all_rotation_data = {}
+                baseline = self.scanner.load_baseline()
                 
                 for angle_idx, angle in enumerate(ROTATION_ANGLES):
                     if angle_idx > 0:
-                        time.sleep(2)  # Simulate rotation delay
+                        time.sleep(2)
                     
-                    data_complex, data_mag = self.scanner.scan_all_paths_complex(MULTI_ANGLE_DIR, angle=angle)
-                    all_complex_data[angle] = data_complex
-                    all_mag_data[angle] = data_mag
+                    data = self.scanner.scan_all_paths(MULTI_ANGLE_DIR, angle=angle)
+                    all_rotation_data[angle] = data
+                    
+                    self.reconstruction_widget.reconstruct_image(data, self.scanner.frequencies, baseline)
                 
-                self.rotation_scans = all_complex_data
-                self.current_complex_data = all_complex_data
+                self.rotation_scans = all_rotation_data
                 
-                # Combine features
-                combined_features = self._combine_rotation_features(all_mag_data)
+                # Combine features by averaging across rotations
+                combined_features = self.scanner.combine_rotation_features(all_rotation_data)
                 self.current_mw_features = combined_features
                 
-                # Reconstruct
-                self._reconstruct_from_rotations(all_complex_data)
+                # Final reconstruction using averaged data
+                self._reconstruct_from_rotations(all_rotation_data)
                 
                 self.fusion_status.setText("Microwave complete. Now perform acoustic analysis.")
                 self.fusion_audio_btn.setEnabled(True)
@@ -1616,9 +2157,34 @@ class PulmoAIMainWindow(QMainWindow):
         self.audio_thread.start()
     
     def _on_fusion_audio_result(self, probs):
-        self.current_audio_probs = probs
+        self.last_ai_probs = probs
+        self.clinical_assessment.show_assessment()
+        # Connect assessment to fusion
+        self.clinical_assessment.assessment_complete.disconnect(self._on_clinical_assessment)
+        self.clinical_assessment.assessment_complete.connect(self._on_fusion_clinical_assessment)
+    
+    def _on_fusion_clinical_assessment(self, patient_symptoms):
+        """Handle clinical assessment for fusion path"""
+        if self.last_ai_probs is None:
+            return
+        
+        environmental_quality = "normal"
+        
+        final_dx, confidence, explanation, all_probs = self.clinical_decision_support.assess(
+            self.last_ai_probs, patient_symptoms, environmental_quality
+        )
+        
+        self.current_audio_probs = np.zeros(5)
+        for i, condition in enumerate(MODEL_CLASSES):
+            if condition in all_probs:
+                self.current_audio_probs[i] = all_probs[condition]
+        
         self.fusion_status.setText("Acoustic complete. Ready for fusion diagnosis.")
         self.fusion_combine_btn.setEnabled(True)
+        
+        # Reconnect the original handler
+        self.clinical_assessment.assessment_complete.disconnect(self._on_fusion_clinical_assessment)
+        self.clinical_assessment.assessment_complete.connect(self._on_clinical_assessment)
     
     def _on_fusion_audio_error(self, error_msg):
         self.fusion_status.setText(f"Acoustic error: {error_msg}")
@@ -1641,9 +2207,9 @@ class PulmoAIMainWindow(QMainWindow):
             class_names = ['baseline', 'healthy', 'tumor']
             result = class_names[pred] if pred < 3 else "unknown"
             
-            audio_class_idx = np.argmax(self.current_audio_probs)
-            audio_class = MODEL_CLASSES[audio_class_idx]
-            audio_conf = self.current_audio_probs[audio_class_idx]
+            audio_dx = np.argmax(self.current_audio_probs)
+            audio_class = MODEL_CLASSES[audio_dx] if audio_dx < len(MODEL_CLASSES) else "unknown"
+            audio_conf = self.current_audio_probs[audio_dx] if audio_dx < len(self.current_audio_probs) else 0
             
             result_text = f"FUSION DIAGNOSIS: {result.upper()}\n\n"
             result_text += f"Overall Confidence: {conf:.1%}\n\n"
@@ -1651,30 +2217,29 @@ class PulmoAIMainWindow(QMainWindow):
             result_text += f"   Microwave (Structural): {['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred]}\n"
             result_text += f"   Acoustic (Functional): {audio_class.upper()} ({audio_conf:.1%})\n\n"
             
-            # Add localization info if available
             if hasattr(self.reconstruction_widget, 'tumor_location') and self.reconstruction_widget.tumor_location:
                 loc = self.reconstruction_widget.tumor_location
                 loc_conf = self.reconstruction_widget.localization_confidence
                 if loc_conf > 0.5:
-                    result_text += f"TUMOR LOCALIZATION:\n"
+                    result_text += "TUMOR LOCALIZATION:\n"
                     result_text += f"   {loc['description']} ({loc['x']:.0f}, {loc['y']:.0f}) mm\n"
                     result_text += f"   Localization Confidence: {loc_conf:.0%}\n\n"
-                    result_text += f"   The model believes this area to be the location of\n"
-                    result_text += f"   abnormal tissue presence requiring further investigation.\n\n"
+                    result_text += "   The model believes this area to be the location of\n"
+                    result_text += "   abnormal tissue presence requiring further investigation.\n\n"
             
             result_text += "Clinical Recommendation:\n"
             
             if result == 'tumor':
-                result_text += "   • Further evaluation recommended\n"
-                result_text += "   • Consider referral for detailed imaging\n"
-                result_text += "   • Schedule follow-up within 2-4 weeks\n"
+                result_text += "   - Further evaluation recommended\n"
+                result_text += "   - Consider referral for detailed imaging\n"
+                result_text += "   - Schedule follow-up within 2-4 weeks\n"
             elif result == 'healthy':
-                result_text += "   • Normal findings\n"
-                result_text += "   • Continue regular health maintenance\n"
-                result_text += "   • Annual check-ups recommended\n"
+                result_text += "   - Normal findings\n"
+                result_text += "   - Continue regular health maintenance\n"
+                result_text += "   - Annual check-ups recommended\n"
             else:
-                result_text += "   • Baseline established\n"
-                result_text += "   • Repeat scan periodically for monitoring\n"
+                result_text += "   - Baseline established\n"
+                result_text += "   - Repeat scan periodically for monitoring\n"
             
             result_text += "\nClinical education content is available on the right panel."
             
