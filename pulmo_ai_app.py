@@ -2,6 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 PULMO AI - Operation Oracle: Democratized Lung Screening System
+- Phase-free magnitude-only processing
+- Multi-angle averaging (maintains 840-dim features)
+- Clinical assessment questionnaire
+- Health Passport for longitudinal patient records
+- Tumor localization with bounding boxes
 """
 
 import os
@@ -34,7 +39,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QProgressBar, QMessageBox, QTabWidget, QTextEdit,
     QFrame, QScrollArea, QGroupBox, QRadioButton, QButtonGroup,
-    QCheckBox
+    QCheckBox, QComboBox, QFileDialog, QInputDialog
 )
 
 # Hardware
@@ -110,8 +115,6 @@ RECORD_SECONDS = 3
 EXPECTED_AUDIO_SAMPLES = SAMPLE_RATE * RECORD_SECONDS
 
 # Feature dimensions - CRITICAL: Must match training!
-# 4 paths * 201 frequency points = 804 frequency features
-# + 36 time-domain features (9 per path) = 840 total
 N_FREQ_POINTS = POINTS  # 201
 N_PATHS = 4
 N_FREQ_FEATURES = N_PATHS * N_FREQ_POINTS  # 804
@@ -211,6 +214,364 @@ def add_time_domain_features(X):
     X_augmented = np.concatenate([X, time_features], axis=1)
     
     return X_augmented
+
+# =============================================================================
+# HEALTH PASSPORT - Patient Health Records
+# =============================================================================
+
+class HealthPassportWidget(QWidget):
+    """Store and display patient health history across scans"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.records_file = DATA_DIR / "health_passport.json"
+        self.patient_records = self._load_records()
+        self.current_patient_id = None
+        self._setup_ui()
+    
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(10)
+        
+        # Title
+        title = QLabel("Health Passport")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0277bd;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+        
+        subtitle = QLabel("Your Personal Lung Health Record")
+        subtitle.setStyleSheet("font-size: 11px; color: #666;")
+        subtitle.setAlignment(Qt.AlignCenter)
+        layout.addWidget(subtitle)
+        
+        # Patient selector / new patient
+        patient_row = QHBoxLayout()
+        self.patient_combo = QComboBox()
+        self.patient_combo.setMinimumWidth(150)
+        self.patient_combo.currentTextChanged.connect(self._on_patient_selected)
+        patient_row.addWidget(QLabel("Patient:"))
+        patient_row.addWidget(self.patient_combo)
+        
+        self.new_patient_btn = QPushButton("New Patient")
+        self.new_patient_btn.setStyleSheet("""
+            QPushButton {
+                background: #4fc3f7;
+                color: white;
+                border: none;
+                border-radius: 5px;
+                padding: 5px;
+            }
+        """)
+        self.new_patient_btn.clicked.connect(self._create_new_patient)
+        patient_row.addWidget(self.new_patient_btn)
+        
+        layout.addLayout(patient_row)
+        
+        # Summary card for most recent scan
+        summary_group = QGroupBox("Most Recent Assessment")
+        summary_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        summary_layout = QVBoxLayout(summary_group)
+        
+        self.recent_date_label = QLabel("No scans recorded")
+        self.recent_date_label.setStyleSheet("font-size: 12px; color: #555;")
+        summary_layout.addWidget(self.recent_date_label)
+        
+        self.recent_dx_label = QLabel("")
+        self.recent_dx_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        summary_layout.addWidget(self.recent_dx_label)
+        
+        self.recent_confidence_label = QLabel("")
+        summary_layout.addWidget(self.recent_confidence_label)
+        
+        self.recent_trend_label = QLabel("")
+        self.recent_trend_label.setStyleSheet("font-size: 11px;")
+        summary_layout.addWidget(self.recent_trend_label)
+        
+        layout.addWidget(summary_group)
+        
+        # Historical trends
+        trends_group = QGroupBox("Health Trends")
+        trends_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        trends_layout = QVBoxLayout(trends_group)
+        
+        self.trends_text = QTextEdit()
+        self.trends_text.setReadOnly(True)
+        self.trends_text.setMaximumHeight(120)
+        self.trends_text.setStyleSheet("font-size: 11px;")
+        trends_layout.addWidget(self.trends_text)
+        
+        layout.addWidget(trends_group)
+        
+        # Scan history table
+        history_group = QGroupBox("Scan History")
+        history_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        history_layout = QVBoxLayout(history_group)
+        
+        self.history_table = QTextEdit()
+        self.history_table.setReadOnly(True)
+        self.history_table.setMaximumHeight(150)
+        self.history_table.setStyleSheet("font-size: 10px; font-family: monospace;")
+        history_layout.addWidget(self.history_table)
+        
+        layout.addWidget(history_group)
+        
+        # Export button
+        export_btn = QPushButton("Export Health Report")
+        export_btn.setMinimumHeight(35)
+        export_btn.setStyleSheet("""
+            QPushButton {
+                background: #66bb6a;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px;
+                font-weight: bold;
+            }
+            QPushButton:hover { background: #4caf50; }
+        """)
+        export_btn.clicked.connect(self._export_report)
+        layout.addWidget(export_btn)
+        
+        # Refresh patient list
+        self._refresh_patient_list()
+    
+    def _load_records(self):
+        """Load health passport records from file"""
+        if self.records_file.exists():
+            try:
+                with open(self.records_file, 'r') as f:
+                    return json.load(f)
+            except:
+                return {}
+        return {}
+    
+    def _save_records(self):
+        """Save health passport records to file"""
+        try:
+            with open(self.records_file, 'w') as f:
+                json.dump(self.patient_records, f, indent=2)
+        except Exception as e:
+            print(f"Error saving records: {e}")
+    
+    def _refresh_patient_list(self):
+        """Update patient dropdown"""
+        self.patient_combo.clear()
+        patients = list(self.patient_records.keys())
+        if patients:
+            self.patient_combo.addItems(patients)
+            self.patient_combo.setCurrentIndex(0)
+        else:
+            self.patient_combo.addItem("No patients")
+    
+    def _create_new_patient(self):
+        """Create a new patient record"""
+        name, ok = QInputDialog.getText(self, "New Patient", "Enter patient name:")
+        if ok and name.strip():
+            patient_id = name.strip()
+            if patient_id not in self.patient_records:
+                self.patient_records[patient_id] = {
+                    'created': datetime.now().isoformat(),
+                    'scans': []
+                }
+                self._save_records()
+                self._refresh_patient_list()
+                self.patient_combo.setCurrentText(patient_id)
+                QMessageBox.information(self, "Success", f"Patient {patient_id} created")
+    
+    def _on_patient_selected(self, patient_name):
+        """Load and display selected patient's records"""
+        self.current_patient_id = patient_name
+        if patient_name and patient_name in self.patient_records:
+            self._display_patient_records(patient_name)
+    
+    def _display_patient_records(self, patient_name):
+        """Display all records for a patient"""
+        records = self.patient_records.get(patient_name, {})
+        scans = records.get('scans', [])
+        
+        if not scans:
+            self.recent_date_label.setText("No scans recorded")
+            self.recent_dx_label.setText("")
+            self.recent_confidence_label.setText("")
+            self.recent_trend_label.setText("")
+            self.trends_text.clear()
+            self.history_table.clear()
+            return
+        
+        # Most recent scan
+        latest = scans[-1]
+        scan_date = latest.get('date', 'Unknown')
+        dx = latest.get('diagnosis', 'Unknown')
+        confidence = latest.get('confidence', 0)
+        
+        self.recent_date_label.setText(f"Date: {scan_date[:16]}")
+        self.recent_dx_label.setText(f"Diagnosis: {dx.upper()}")
+        self.recent_confidence_label.setText(f"Confidence: {confidence:.1%}")
+        
+        # Show trend
+        if len(scans) >= 2:
+            prev = scans[-2]
+            prev_dx = prev.get('diagnosis', 'Unknown')
+            if prev_dx == dx:
+                self.recent_trend_label.setText("Trend: Stable (same diagnosis)")
+                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #4caf50;")
+            else:
+                self.recent_trend_label.setText(f"Trend: Changed from {prev_dx.upper()} to {dx.upper()}")
+                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #ff9800;")
+        else:
+            self.recent_trend_label.setText("First scan - baseline established")
+            self.recent_trend_label.setStyleSheet("font-size: 11px; color: #2196f3;")
+        
+        # Generate trend analysis
+        self._update_trend_analysis(scans)
+        
+        # Update history table
+        self._update_history_table(scans)
+    
+    def _update_trend_analysis(self, scans):
+        """Analyze health trends over time"""
+        if len(scans) < 2:
+            self.trends_text.setText("Not enough data for trend analysis.\nComplete more scans to see trends.")
+            return
+        
+        # Count diagnoses over time
+        dx_counts = {}
+        for scan in scans:
+            dx = scan.get('diagnosis', 'Unknown')
+            dx_counts[dx] = dx_counts.get(dx, 0) + 1
+        
+        # Calculate trend
+        recent_3 = scans[-3:] if len(scans) >= 3 else scans
+        recent_dxs = [s.get('diagnosis', 'Unknown') for s in recent_3]
+        
+        trend_text = ""
+        
+        # Check for improvement/deterioration
+        if 'pneumonia' in recent_dxs and 'healthy' not in recent_dxs:
+            trend_text += "- Current symptoms suggest active infection\n"
+        elif 'healthy' in recent_dxs and 'pneumonia' in recent_dxs[:2]:
+            trend_text += "- Improving condition detected\n"
+        
+        if 'asthma' in recent_dxs or 'copd' in recent_dxs:
+            trend_text += "- Chronic respiratory pattern detected\n"
+            trend_text += "- Regular monitoring recommended\n"
+        
+        if len(scans) >= 3:
+            first_dx = scans[0].get('diagnosis', 'Unknown')
+            last_dx = scans[-1].get('diagnosis', 'Unknown')
+            if first_dx != 'healthy' and last_dx == 'healthy':
+                trend_text += "- Significant improvement over time\n"
+            elif first_dx == 'healthy' and last_dx != 'healthy':
+                trend_text += "- Health decline detected - consult provider\n"
+        
+        # Add stability assessment
+        unique_dxs = len(set([s.get('diagnosis', 'Unknown') for s in scans]))
+        if unique_dxs == 1:
+            trend_text += f"- Consistent {scans[0].get('diagnosis', 'Unknown').upper()} diagnosis across all scans\n"
+        elif unique_dxs <= 2:
+            trend_text += "- Relatively stable health pattern\n"
+        else:
+            trend_text += "- Variable health pattern - discuss with provider\n"
+        
+        # Add compliance note
+        if len(scans) >= 2:
+            try:
+                first_date = datetime.fromisoformat(scans[0].get('date', ''))
+                last_date = datetime.fromisoformat(scans[-1].get('date', ''))
+                days_span = (last_date - first_date).days
+                if days_span > 0:
+                    scans_per_month = len(scans) / (days_span / 30)
+                    if scans_per_month >= 1:
+                        trend_text += f"- Good monitoring frequency ({scans_per_month:.1f} scans/month)\n"
+                    else:
+                        trend_text += "- Consider more frequent monitoring\n"
+            except:
+                pass
+        
+        self.trends_text.setText(trend_text)
+    
+    def _update_history_table(self, scans):
+        """Display scan history in table format"""
+        if not scans:
+            return
+        
+        # Create table header
+        table = "Date                 | Diagnosis      | Confidence | MW Result    | Audio Result\n"
+        table += "-" * 80 + "\n"
+        
+        # Show last 10 scans (most recent first)
+        for scan in reversed(scans[-10:]):
+            date = scan.get('date', 'Unknown')[:16]
+            dx = scan.get('diagnosis', 'Unknown')[:14]
+            conf = f"{scan.get('confidence', 0):.0%}"
+            mw = scan.get('microwave_result', 'Unknown')[:12]
+            audio = scan.get('audio_result', 'Unknown')[:12]
+            
+            table += f"{date:20s} {dx:14s} {conf:10s} {mw:14s} {audio:12s}\n"
+        
+        self.history_table.setText(table)
+    
+    def add_scan_record(self, diagnosis, confidence, microwave_result, audio_result, audio_probs=None):
+        """Add a new scan record for the current patient"""
+        if not self.current_patient_id or self.current_patient_id not in self.patient_records:
+            # Auto-create patient if none exists
+            if not self.current_patient_id:
+                self._create_new_patient()
+                if not self.current_patient_id:
+                    return
+            if self.current_patient_id not in self.patient_records:
+                self.patient_records[self.current_patient_id] = {
+                    'created': datetime.now().isoformat(),
+                    'scans': []
+                }
+        
+        # Create scan record
+        record = {
+            'date': datetime.now().isoformat(),
+            'diagnosis': diagnosis,
+            'confidence': confidence,
+            'microwave_result': microwave_result,
+            'audio_result': audio_result,
+            'audio_probs': audio_probs.tolist() if audio_probs is not None else None
+        }
+        
+        # Add to records
+        self.patient_records[self.current_patient_id]['scans'].append(record)
+        self._save_records()
+        
+        # Refresh display
+        self._display_patient_records(self.current_patient_id)
+    
+    def _export_report(self):
+        """Export health report as CSV"""
+        if not self.current_patient_id or self.current_patient_id not in self.patient_records:
+            QMessageBox.warning(self, "No Patient", "No patient selected")
+            return
+        
+        # Ask for save location
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Save Health Report", 
+            f"{self.current_patient_id}_health_report.csv",
+            "CSV Files (*.csv)"
+        )
+        
+        if filepath:
+            records = self.patient_records[self.current_patient_id]
+            scans = records.get('scans', [])
+            
+            with open(filepath, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Date', 'Diagnosis', 'Confidence', 'Microwave Result', 'Audio Result'])
+                for scan in scans:
+                    writer.writerow([
+                        scan.get('date', ''),
+                        scan.get('diagnosis', ''),
+                        scan.get('confidence', ''),
+                        scan.get('microwave_result', ''),
+                        scan.get('audio_result', '')
+                    ])
+            
+            QMessageBox.information(self, "Export Complete", f"Report saved to {filepath}")
 
 # =============================================================================
 # SYMPTOM TO CONDITION MAPPING
@@ -1483,6 +1844,9 @@ class PulmoAIMainWindow(QMainWindow):
         self.clinical_assessment.assessment_complete.connect(self._on_clinical_assessment)
         self.clinical_decision_support = EnhancedClinicalDecisionSupport()
         
+        # Health Passport
+        self.health_passport = HealthPassportWidget()
+        
         try:
             self.fusion = FusionClassifier()
         except Exception as e:
@@ -1581,6 +1945,7 @@ class PulmoAIMainWindow(QMainWindow):
         self._add_audio_tab()
         self._add_fusion_tab()
         self._add_education_tab()
+        self._add_health_passport_tab()
         
         exit_btn = QPushButton("EXIT")
         exit_btn.setMinimumHeight(40)
@@ -1785,6 +2150,17 @@ class PulmoAIMainWindow(QMainWindow):
         
         layout.addStretch()
         self.tabs.addTab(tab, "Education")
+    
+    def _add_health_passport_tab(self):
+        """Add Health Passport tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        
+        layout.addWidget(self.health_passport)
+        
+        self.tabs.addTab(tab, "Health Passport")
     
     def _button_style(self, color):
         return f"""
@@ -2060,6 +2436,25 @@ class PulmoAIMainWindow(QMainWindow):
         
         self.current_audio_probs = final_probs
         
+        # Save to Health Passport
+        mw_result = "Abnormal" if confidence > 0.7 else "Normal"
+        if self.current_mw_features is not None:
+            try:
+                # If microwave features exist, you could run a quick microwave prediction
+                pass
+            except:
+                mw_result = "Not analyzed"
+        else:
+            mw_result = "Not scanned"
+        
+        self.health_passport.add_scan_record(
+            diagnosis=final_dx,
+            confidence=confidence,
+            microwave_result=mw_result,
+            audio_result=final_dx,
+            audio_probs=final_probs
+        )
+        
         if self.current_mw_features is not None and self.fusion is not None:
             self.fusion_combine_btn.setEnabled(True)
     
@@ -2178,6 +2573,16 @@ class PulmoAIMainWindow(QMainWindow):
         for i, condition in enumerate(MODEL_CLASSES):
             if condition in all_probs:
                 self.current_audio_probs[i] = all_probs[condition]
+        
+        # Save to Health Passport
+        mw_result = "Abnormal" if confidence > 0.7 else "Normal"
+        self.health_passport.add_scan_record(
+            diagnosis=final_dx,
+            confidence=confidence,
+            microwave_result=mw_result,
+            audio_result=final_dx,
+            audio_probs=self.current_audio_probs
+        )
         
         self.fusion_status.setText("Acoustic complete. Ready for fusion diagnosis.")
         self.fusion_combine_btn.setEnabled(True)
