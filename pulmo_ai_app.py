@@ -2,16 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 PULMO AI - Operation Oracle: Democratized Lung Screening System
-- Phase-free magnitude-only processing
-- Multi-angle averaging (maintains 840-dim features)
-- Clinical assessment questionnaire
-- Health Passport for longitudinal patient records
-- Enhanced fusion with clinical reasoning
 """
 
 import os
 
-# Force OpenGL ES - must be set before any Qt imports
+# Needs to force OpenGL ES, as it must be set before any Qt imports
 if 'QT_OPENGL' not in os.environ:
     os.environ['QT_OPENGL'] = 'es2'
 if 'QT_QPA_EGLFS_HIDECURSOR' not in os.environ:
