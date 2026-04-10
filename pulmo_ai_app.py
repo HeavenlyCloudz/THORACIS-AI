@@ -6,7 +6,7 @@ PULMO AI - Operation Oracle: Democratized Lung Screening System
 - Multi-angle averaging (maintains 840-dim features)
 - Clinical assessment questionnaire
 - Health Passport for longitudinal patient records
-- Tumor localization with bounding boxes
+- Enhanced fusion with clinical reasoning
 """
 
 import os
@@ -2100,8 +2100,8 @@ class PulmoAIMainWindow(QMainWindow):
         
         self.fusion_result = QTextEdit()
         self.fusion_result.setReadOnly(True)
-        self.fusion_result.setMinimumHeight(200)
-        self.fusion_result.setStyleSheet("font-size: 12px;")
+        self.fusion_result.setMinimumHeight(300)
+        self.fusion_result.setStyleSheet("font-size: 12px; font-family: monospace;")
         layout.addWidget(self.fusion_result)
         
         self.tabs.addTab(tab, "Fusion")
@@ -2440,7 +2440,6 @@ class PulmoAIMainWindow(QMainWindow):
         mw_result = "Abnormal" if confidence > 0.7 else "Normal"
         if self.current_mw_features is not None:
             try:
-                # If microwave features exist, you could run a quick microwave prediction
                 pass
             except:
                 mw_result = "Not analyzed"
@@ -2599,6 +2598,7 @@ class PulmoAIMainWindow(QMainWindow):
         self.fusion_audio_btn.setEnabled(True)
     
     def _run_fusion(self):
+        """Enhanced fusion with clinical interpretation"""
         if self.current_mw_features is None or self.current_audio_probs is None:
             QMessageBox.warning(self, "Missing Data", "Perform both scans first!")
             return
@@ -2616,42 +2616,147 @@ class PulmoAIMainWindow(QMainWindow):
             audio_class = MODEL_CLASSES[audio_dx] if audio_dx < len(MODEL_CLASSES) else "unknown"
             audio_conf = self.current_audio_probs[audio_dx] if audio_dx < len(self.current_audio_probs) else 0
             
-            result_text = f"FUSION DIAGNOSIS: {result.upper()}\n\n"
-            result_text += f"Overall Confidence: {conf:.1%}\n\n"
-            result_text += "Multimodal Interpretation:\n"
-            result_text += f"   Microwave (Structural): {['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred]}\n"
-            result_text += f"   Acoustic (Functional): {audio_class.upper()} ({audio_conf:.1%})\n\n"
+            # Get all audio probabilities for richer interpretation
+            audio_probs_dict = {}
+            for i, cls in enumerate(MODEL_CLASSES):
+                if i < len(self.current_audio_probs):
+                    audio_probs_dict[cls] = self.current_audio_probs[i]
             
+            # Sort audio probabilities
+            sorted_audio = sorted(audio_probs_dict.items(), key=lambda x: x[1], reverse=True)
+            
+            # ========== ENHANCED CLINICAL INTERPRETATION ==========
+            
+            # Build interpretation based on fusion result + audio signature
+            interpretation = ""
+            clinical_insight = ""
+            
+            if result == 'tumor':
+                # TUMOR DETECTED - what does the audio suggest?
+                if audio_class == 'pneumonia' and audio_conf > 0.6:
+                    interpretation = "TUMOR PRESENT with PNEUMONIA-like sound signature"
+                    clinical_insight = ("Clinical Insight: The tumor may be causing airway obstruction that mimics pneumonia. "
+                                       "Alternatively, a tumor with superimposed infection is possible. "
+                                       "Further imaging (CT) recommended to distinguish.")
+                elif audio_class == 'asthma' and audio_conf > 0.6:
+                    interpretation = "TUMOR PRESENT with ASTHMA-like sound signature"
+                    clinical_insight = ("Clinical Insight: The tumor may be causing localized wheezing by partially blocking an airway. "
+                                       "This pattern can mimic asthma but is typically unilateral. "
+                                       "Bronchoscopy may be indicated.")
+                elif audio_class == 'copd' and audio_conf > 0.6:
+                    interpretation = "TUMOR PRESENT with COPD-like sound signature"
+                    clinical_insight = ("Clinical Insight: The tumor is affecting airflow dynamics. "
+                                       "Differentiating tumor from COPD exacerbation requires imaging correlation. "
+                                       "Consider pulmonary function testing.")
+                elif audio_class == 'healthy' and audio_conf > 0.6:
+                    interpretation = "TUMOR PRESENT with NORMAL breath sounds"
+                    clinical_insight = ("Clinical Insight: This suggests an early or peripherally located tumor "
+                                       "that hasn't yet affected airway function. "
+                                       "Favorable for early intervention.")
+                elif audio_class == 'bronchial' and audio_conf > 0.6:
+                    interpretation = "TUMOR PRESENT with BRONCHIAL inflammation pattern"
+                    clinical_insight = ("Clinical Insight: Tumor may be irritating the main airways. "
+                                       "The combination suggests possible endobronchial lesion.")
+                else:
+                    interpretation = f"TUMOR PRESENT with {audio_class.upper()} sound signature ({audio_conf:.0%} confidence)"
+                    clinical_insight = ("Clinical Insight: The acoustic pattern suggests functional abnormality "
+                                       "alongside the structural finding. Clinical correlation recommended.")
+            
+            elif result == 'healthy':
+                # HEALTHY - but check if audio disagrees
+                if audio_class != 'healthy' and audio_conf > 0.7:
+                    interpretation = "STRUCTURALLY NORMAL but FUNCTIONAL ABNORMALITY detected"
+                    clinical_insight = (f"Clinical Insight: Microwave shows normal tissue structure, but breath sounds suggest {audio_class}. "
+                                       "This pattern is consistent with functional airway disease (asthma/COPD/bronchitis) "
+                                       "without structural changes. Reassuring for tumor absence, but respiratory symptoms warrant clinical evaluation.")
+                else:
+                    interpretation = "NORMAL lung structure AND function"
+                    clinical_insight = ("Clinical Insight: Both structural (microwave) and functional (acoustic) assessments are normal. "
+                                       "No evidence of tumor or significant airway disease. Continue regular health maintenance.")
+            
+            else:  # baseline
+                if audio_class != 'healthy' and audio_conf > 0.6:
+                    interpretation = "BASELINE ESTABLISHED with functional changes"
+                    clinical_insight = (f"Clinical Insight: Microwave establishes normal baseline, but breath sounds suggest {audio_class}. "
+                                       "This may represent early functional disease. Recommended: repeat scan in 3-6 months to monitor for changes.")
+                else:
+                    interpretation = "BASELINE ESTABLISHED - Normal findings"
+                    clinical_insight = ("Clinical Insight: Baseline measurements recorded. "
+                                       "Continue periodic monitoring as part of routine health maintenance.")
+            
+            # Build the enhanced result text
+            result_text = "=" * 60 + "\n"
+            result_text += "PULMO AI FUSION DIAGNOSIS\n"
+            result_text += "=" * 60 + "\n\n"
+            
+            result_text += f"FUSION RESULT: {result.upper()}\n"
+            result_text += f"   Overall Confidence: {conf:.1%}\n\n"
+            
+            result_text += "MULTIMODAL FINDINGS:\n"
+            result_text += "   ┌─────────────────────────────────────────────┐\n"
+            result_text += f"   │ Microwave (Structural): {['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred]:<20} │\n"
+            result_text += f"   │ Acoustic (Functional): {audio_class.upper():<20} ({audio_conf:.0%}) │\n"
+            result_text += "   └─────────────────────────────────────────────┘\n\n"
+            
+            result_text += f"CLINICAL INTERPRETATION:\n"
+            result_text += f"   {interpretation}\n\n"
+            result_text += f"   {clinical_insight}\n\n"
+            
+            # Add audio probability breakdown
+            result_text += "ACOUSTIC SIGNATURE DETAILS:\n"
+            for condition, prob in sorted_audio[:3]:
+                bar_length = int(prob * 20)
+                bar = "█" * bar_length + "░" * (20 - bar_length)
+                result_text += f"   {condition:12s} [{bar}] {prob:.0%}\n"
+            
+            result_text += "\n"
+            
+            # Add tumor localization if available
             if hasattr(self.reconstruction_widget, 'tumor_location') and self.reconstruction_widget.tumor_location:
                 loc = self.reconstruction_widget.tumor_location
                 loc_conf = self.reconstruction_widget.localization_confidence
                 if loc_conf > 0.5:
                     result_text += "TUMOR LOCALIZATION:\n"
-                    result_text += f"   {loc['description']} ({loc['x']:.0f}, {loc['y']:.0f}) mm\n"
-                    result_text += f"   Localization Confidence: {loc_conf:.0%}\n\n"
-                    result_text += "   The model believes this area to be the location of\n"
-                    result_text += "   abnormal tissue presence requiring further investigation.\n\n"
+                    result_text += f"   Region: {loc['description']}\n"
+                    result_text += f"   Coordinates: ({loc['x']:.0f} mm, {loc['y']:.0f} mm)\n"
+                    result_text += f"   Confidence: {loc_conf:.0%}\n\n"
             
-            result_text += "Clinical Recommendation:\n"
-            
+            # Clinical recommendations based on fusion result
+            result_text += "RECOMMENDATIONS:\n"
             if result == 'tumor':
-                result_text += "   - Further evaluation recommended\n"
-                result_text += "   - Consider referral for detailed imaging\n"
-                result_text += "   - Schedule follow-up within 2-4 weeks\n"
+                result_text += "   - Schedule follow-up with pulmonologist within 2-4 weeks\n"
+                result_text += "   - Consider chest CT for detailed characterization\n"
+                result_text += "   - Document any cough, hemoptysis, or weight changes\n"
             elif result == 'healthy':
-                result_text += "   - Normal findings\n"
-                result_text += "   - Continue regular health maintenance\n"
-                result_text += "   - Annual check-ups recommended\n"
-            else:
-                result_text += "   - Baseline established\n"
-                result_text += "   - Repeat scan periodically for monitoring\n"
+                if audio_class != 'healthy' and audio_conf > 0.7:
+                    result_text += "   - Clinical evaluation for respiratory symptoms\n"
+                    result_text += "   - Spirometry to assess airway function\n"
+                    result_text += "   - Repeat PULMO AI scan in 6 months\n"
+                else:
+                    result_text += "   - Continue regular health maintenance\n"
+                    result_text += "   - Annual lung health screening recommended\n"
+            else:  # baseline
+                result_text += "   - Establish baseline with regular monitoring\n"
+                result_text += "   - Repeat scan in 6-12 months\n"
+                result_text += "   - Report any new respiratory symptoms\n"
             
-            result_text += "\nClinical education content is available on the right panel."
+            result_text += "\n" + "=" * 60 + "\n"
+            result_text += "DISCLAIMER: AI-assisted screening tool. Not a substitute for professional medical diagnosis.\n"
+            result_text += "Operation Oracle | Democratizing Early Detection"
             
             self.fusion_result.setText(result_text)
-            self.fusion_status.setText(f"Diagnosis: {result} ({conf:.1%})")
+            self.fusion_status.setText(f"Diagnosis: {result} ({conf:.1%}) - Audio: {audio_class}")
             
             self.educational_widget.show_condition(audio_class, audio_conf)
+            
+            # Save to Health Passport
+            self.health_passport.add_scan_record(
+                diagnosis=result,
+                confidence=conf,
+                microwave_result=['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred],
+                audio_result=audio_class,
+                audio_probs=self.current_audio_probs
+            )
             
         except Exception as e:
             self.fusion_result.setText(f"Fusion error: {e}")
