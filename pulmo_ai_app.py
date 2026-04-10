@@ -2593,7 +2593,7 @@ class PulmoAIMainWindow(QMainWindow):
         self.fusion_audio_btn.setEnabled(True)
     
     def _run_fusion(self):
-        """Enhanced fusion with clinical interpretation"""
+        """Enhanced fusion with clinical interpretation - maps baseline to healthy"""
         if self.current_mw_features is None or self.current_audio_probs is None:
             QMessageBox.warning(self, "Missing Data", "Perform both scans first!")
             return
@@ -2604,8 +2604,27 @@ class PulmoAIMainWindow(QMainWindow):
         
         try:
             pred, conf = self.fusion.predict(self.current_mw_features, self.current_audio_probs)
-            class_names = ['baseline', 'healthy', 'tumor']
-            result = class_names[pred] if pred < 3 else "unknown"
+            
+            # CRITICAL: Map baseline (0) to healthy for clinical output
+            # Original classes: 0=baseline, 1=healthy, 2=tumor
+            if pred == 0:
+                clinical_result = "healthy"
+                microwave_display = "Normal"
+            elif pred == 1:
+                clinical_result = "healthy"
+                microwave_display = "Normal"
+            else:  # pred == 2
+                clinical_result = "tumor"
+                microwave_display = "Definite Anomaly"
+            
+            # Also map the microwave display text
+            microwave_text = ""
+            if pred == 0:
+                microwave_text = "Normal (baseline reference)"
+            elif pred == 1:
+                microwave_text = "Normal"
+            else:
+                microwave_text = "Definite Anomaly"
             
             audio_dx = np.argmax(self.current_audio_probs)
             audio_class = MODEL_CLASSES[audio_dx] if audio_dx < len(MODEL_CLASSES) else "unknown"
@@ -2626,7 +2645,7 @@ class PulmoAIMainWindow(QMainWindow):
             interpretation = ""
             clinical_insight = ""
             
-            if result == 'tumor':
+            if clinical_result == 'tumor':
                 # TUMOR DETECTED - what does the audio suggest?
                 if audio_class == 'pneumonia' and audio_conf > 0.6:
                     interpretation = "TUMOR PRESENT with PNEUMONIA-like sound signature"
@@ -2657,10 +2676,10 @@ class PulmoAIMainWindow(QMainWindow):
                     clinical_insight = ("Clinical Insight: The acoustic pattern suggests functional abnormality "
                                        "alongside the structural finding. Clinical correlation recommended.")
             
-            elif result == 'healthy':
+            else:  # healthy (includes both baseline and healthy from model)
                 # HEALTHY - but check if audio disagrees
                 if audio_class != 'healthy' and audio_conf > 0.7:
-                    interpretation = "STRUCTURALLY NORMAL but FUNCTIONAL ABNORMALITY detected"
+                    interpretation = "NORMAL STRUCTURE with FUNCTIONAL ABNORMALITY detected"
                     clinical_insight = (f"Clinical Insight: Microwave shows normal tissue structure, but breath sounds suggest {audio_class}. "
                                        "This pattern is consistent with functional airway disease (asthma/COPD/bronchitis) "
                                        "without structural changes. Reassuring for tumor absence, but respiratory symptoms warrant clinical evaluation.")
@@ -2669,31 +2688,25 @@ class PulmoAIMainWindow(QMainWindow):
                     clinical_insight = ("Clinical Insight: Both structural (microwave) and functional (acoustic) assessments are normal. "
                                        "No evidence of tumor or significant airway disease. Continue regular health maintenance.")
             
-            else:  # baseline
-                if audio_class != 'healthy' and audio_conf > 0.6:
-                    interpretation = "BASELINE ESTABLISHED with functional changes"
-                    clinical_insight = (f"Clinical Insight: Microwave establishes normal baseline, but breath sounds suggest {audio_class}. "
-                                       "This may represent early functional disease. Recommended: repeat scan in 3-6 months to monitor for changes.")
-                else:
-                    interpretation = "BASELINE ESTABLISHED - Normal findings"
-                    clinical_insight = ("Clinical Insight: Baseline measurements recorded. "
-                                       "Continue periodic monitoring as part of routine health maintenance.")
-            
             # Build the enhanced result text
             result_text = "=" * 60 + "\n"
             result_text += "PULMO AI FUSION DIAGNOSIS\n"
             result_text += "=" * 60 + "\n\n"
             
-            result_text += f"FUSION RESULT: {result.upper()}\n"
+            # FINAL CLINICAL OUTPUT - This is what the patient sees first
+            if clinical_result == 'tumor':
+                result_text += "FINAL CLINICAL ASSESSMENT: ABNORMAL - TUMOR SUSPECTED\n"
+            else:
+                result_text += "FINAL CLINICAL ASSESSMENT: NORMAL - NO TUMOR DETECTED\n"
             result_text += f"   Overall Confidence: {conf:.1%}\n\n"
             
             result_text += "MULTIMODAL FINDINGS:\n"
             result_text += "   ┌─────────────────────────────────────────────┐\n"
-            result_text += f"   │ Microwave (Structural): {['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred]:<20} │\n"
+            result_text += f"   │ Microwave (Structural): {microwave_text:<28} │\n"
             result_text += f"   │ Acoustic (Functional): {audio_class.upper():<20} ({audio_conf:.0%}) │\n"
             result_text += "   └─────────────────────────────────────────────┘\n\n"
             
-            result_text += f"CLINICAL INTERPRETATION:\n"
+            result_text += "CLINICAL INTERPRETATION:\n"
             result_text += f"   {interpretation}\n\n"
             result_text += f"   {clinical_insight}\n\n"
             
@@ -2710,7 +2723,7 @@ class PulmoAIMainWindow(QMainWindow):
             if hasattr(self.reconstruction_widget, 'tumor_location') and self.reconstruction_widget.tumor_location:
                 loc = self.reconstruction_widget.tumor_location
                 loc_conf = self.reconstruction_widget.localization_confidence
-                if loc_conf > 0.5:
+                if loc_conf > 0.5 and clinical_result == 'tumor':
                     result_text += "TUMOR LOCALIZATION:\n"
                     result_text += f"   Region: {loc['description']}\n"
                     result_text += f"   Coordinates: ({loc['x']:.0f} mm, {loc['y']:.0f} mm)\n"
@@ -2718,11 +2731,11 @@ class PulmoAIMainWindow(QMainWindow):
             
             # Clinical recommendations based on fusion result
             result_text += "RECOMMENDATIONS:\n"
-            if result == 'tumor':
+            if clinical_result == 'tumor':
                 result_text += "   - Schedule follow-up with pulmonologist within 2-4 weeks\n"
                 result_text += "   - Consider chest CT for detailed characterization\n"
                 result_text += "   - Document any cough, hemoptysis, or weight changes\n"
-            elif result == 'healthy':
+            else:
                 if audio_class != 'healthy' and audio_conf > 0.7:
                     result_text += "   - Clinical evaluation for respiratory symptoms\n"
                     result_text += "   - Spirometry to assess airway function\n"
@@ -2730,25 +2743,27 @@ class PulmoAIMainWindow(QMainWindow):
                 else:
                     result_text += "   - Continue regular health maintenance\n"
                     result_text += "   - Annual lung health screening recommended\n"
-            else:  # baseline
-                result_text += "   - Establish baseline with regular monitoring\n"
-                result_text += "   - Repeat scan in 6-12 months\n"
-                result_text += "   - Report any new respiratory symptoms\n"
             
             result_text += "\n" + "=" * 60 + "\n"
             result_text += "DISCLAIMER: AI-assisted screening tool. Not a substitute for professional medical diagnosis.\n"
             result_text += "Operation Oracle | Democratizing Early Detection"
             
             self.fusion_result.setText(result_text)
-            self.fusion_status.setText(f"Diagnosis: {result} ({conf:.1%}) - Audio: {audio_class}")
             
+            # Update status bar with clear clinical message
+            if clinical_result == 'tumor':
+                self.fusion_status.setText(f"CLINICAL DIAGNOSIS: ABNORMAL - Tumor suspected ({conf:.1%})")
+            else:
+                self.fusion_status.setText(f"CLINICAL DIAGNOSIS: NORMAL - No tumor detected ({conf:.1%})")
+            
+            # Show educational content based on audio
             self.educational_widget.show_condition(audio_class, audio_conf)
             
-            # Save to Health Passport
+            # Save to Health Passport with clinical label
             self.health_passport.add_scan_record(
-                diagnosis=result,
+                diagnosis=clinical_result,
                 confidence=conf,
-                microwave_result=['Normal', 'Possible Anomaly', 'Definite Anomaly'][pred],
+                microwave_result=microwave_text,
                 audio_result=audio_class,
                 audio_probs=self.current_audio_probs
             )
@@ -2756,11 +2771,6 @@ class PulmoAIMainWindow(QMainWindow):
         except Exception as e:
             self.fusion_result.setText(f"Fusion error: {e}")
             traceback.print_exc()
-    
-    def closeEvent(self, event):
-        print("\nShutting down PULMO AI: Operation Oracle...")
-        self.scanner.cleanup()
-        event.accept()
 
 # =============================================================================
 # MAIN
