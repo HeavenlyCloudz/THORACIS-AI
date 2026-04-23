@@ -1,8 +1,8 @@
-# PULMO-AI 🫁
+# THORACIS AI 🫁
 
 **An integrated acoustic-microwave fusion platform for non-invasive, accessible lung cancer screening**
 
-PULMO-AI is a research-driven biomedical engineering project that combines microwave imaging, acoustic analysis, and deep learning to create an affordable, portable lung cancer screening system. By fusing structural microwave data with functional acoustic signatures, PULMO-AI aims to democratize early lung cancer detection—especially in underserved and remote communities where traditional diagnostic infrastructure is unavailable.
+THORACIS AI is a research-driven biomedical engineering project that combines microwave imaging, acoustic analysis, and deep learning to create an affordable, portable lung cancer screening system. By fusing structural microwave data with functional acoustic signatures, THORACIS AI aims to democratize early lung cancer detection—especially in underserved and remote communities where traditional diagnostic infrastructure is unavailable.
 
 ---
 
@@ -15,7 +15,7 @@ Lung cancer remains the leading cause of cancer death worldwide, largely due to 
 - **🌍 Accessibility:** Rural and remote communities lack access to screening infrastructure
 - **👨‍⚕️ Expertise:** Shortage of radiologists to interpret results, especially in low-income regions
 
-PULMO-AI addresses these challenges through a novel **dual-modality fusion approach** combining:
+THORACIS AI addresses these challenges through a novel **dual-modality fusion approach** combining:
 
 1. **Microwave imaging** — Safe, non-ionizing structural sensing of lung tissue using ultra-wideband antennas
 2. **Acoustic analysis** — Functional assessment of lung health through digital auscultation and deep learning
@@ -135,8 +135,8 @@ scores, embeddings, spectrogram = yamnet_model(audio)
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/HeavenlyCloudz/PULMO-AI.git
-cd PULMO-AI
+git clone https://github.com/HeavenlyCloudz/THORACIS AI.git
+cd THORACIS AI
 ```
 
 ### 2. Install Dependencies
@@ -563,7 +563,7 @@ Spatial sensitivity: ±2.1 dB variation with tumor position.
 ## 📁 Repository Structure
 
 ```text
-PULMO-AI/
+THORACIS AI/
 ├── README.md
 ├── requirements.txt
 ├── LICENSE
@@ -635,7 +635,7 @@ Microwave imaging, acoustic analysis, safety standards, and health equity litera
 Project Lead: Anie Udofia  
 William Aberhart High School, Calgary, AB  
 GitHub: @HeavenlyCloudz  
-Repository: github.com/HeavenlyCloudz/PULMO-AI  
+Repository: github.com/HeavenlyCloudz/THORACIS AI  
 
 ---
 
