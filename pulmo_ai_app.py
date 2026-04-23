@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PULMO AI - Operation Oracle: Democratized Lung Screening System
+THORACIS AI - Operation Oracle: Democratized Lung Screening System
 """
 
 import os
@@ -1822,10 +1822,10 @@ class FusionClassifier:
 # MAIN GUI APPLICATION
 # =============================================================================
 
-class PulmoAIMainWindow(QMainWindow):
+class ThoracisAIMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PULMO AI: Operation Oracle - Lung Screening System")
+        self.setWindowTitle("THORACIS AI: Operation Oracle - Lung Screening System")
         
         self.vna = VNADirectController()
         self.scanner = MicrowaveScanner(self.vna)
@@ -1889,7 +1889,7 @@ class PulmoAIMainWindow(QMainWindow):
         left_layout.setContentsMargins(10, 10, 10, 10)
         left_layout.setSpacing(10)
         
-        title = QLabel("PULMO AI: Operation Oracle")
+        title = QLabel("THORACIS AI: Operation Oracle")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("""
             font-size: 32px;
@@ -2411,7 +2411,7 @@ class PulmoAIMainWindow(QMainWindow):
             'healthy': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - No specific treatment needed\n   - Maintain healthy lifestyle\n   - Regular exercise and good nutrition\n   - Annual check-ups recommended\n"
         }
         
-        result_text = "PULMO AI CLINICAL ASSESSMENT\n\n"
+        result_text = "THORACIS AI CLINICAL ASSESSMENT\n\n"
         result_text += explanation
         result_text += recommendations.get(final_dx, "")
         result_text += "\n\n" + "=" * 50 + "\n"
@@ -2690,7 +2690,7 @@ class PulmoAIMainWindow(QMainWindow):
             
             # Build the enhanced result text
             result_text = "=" * 60 + "\n"
-            result_text += "PULMO AI FUSION DIAGNOSIS\n"
+            result_text += "THORACIS AI FUSION DIAGNOSIS\n"
             result_text += "=" * 60 + "\n\n"
             
             # FINAL CLINICAL OUTPUT - This is what the patient sees first
@@ -2739,7 +2739,7 @@ class PulmoAIMainWindow(QMainWindow):
                 if audio_class != 'healthy' and audio_conf > 0.7:
                     result_text += "   - Clinical evaluation for respiratory symptoms\n"
                     result_text += "   - Spirometry to assess airway function\n"
-                    result_text += "   - Repeat PULMO AI scan in 6 months\n"
+                    result_text += "   - Repeat THORACIS AI scan in 6 months\n"
                 else:
                     result_text += "   - Continue regular health maintenance\n"
                     result_text += "   - Annual lung health screening recommended\n"
@@ -2785,6 +2785,6 @@ if __name__ == '__main__':
         QApplication.setAttribute(Qt.AA_UseOpenGLES, True)
 
     app = QApplication(sys.argv)
-    window = PulmoAIMainWindow()
+    window = ThoracisAIMainWindow()
     window.showFullScreen()
     sys.exit(app.exec())
