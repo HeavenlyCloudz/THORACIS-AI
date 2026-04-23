@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PULMO‑AI Unified Application – TFLite Only Version
+THORACIS‑AI Unified Application – TFLite Only Version
 - Uses tflite-runtime (lightweight) for all ML inference
 - No TensorFlow dependency
 - Network VNA communication
@@ -414,10 +414,10 @@ class FusionClassifier:
 # =============================================================================
 # Main GUI Application
 # =============================================================================
-class PulmoAIMainWindow(QMainWindow):
+class ThoracisAIMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PULMO‑AI: Lung Screening System")
+        self.setWindowTitle("THORACIS‑AI: Lung Screening System")
         
         # Initialize components
         self.vna_client = VNAClient(VNA_SERVER_IP, VNA_SERVER_PORT)
@@ -447,7 +447,7 @@ class PulmoAIMainWindow(QMainWindow):
         layout.setSpacing(15)
         
         # Title
-        title = QLabel("🫁 PULMO‑AI")
+        title = QLabel("🫁 THORACIS‑AI")
         title.setAlignment(Qt.AlignCenter)
         title.setStyleSheet("""
             font-size: 48px;
@@ -855,7 +855,7 @@ class PulmoAIMainWindow(QMainWindow):
             self.fusion_result.setText(f"❌ Fusion error: {e}")
     
     def closeEvent(self, event):
-        print("\n🛑 Shutting down PULMO-AI...")
+        print("\n🛑 Shutting down THORACIS-AI...")
         self.scanner.cleanup()
         self.vna_client.close()
         event.accept()
@@ -876,7 +876,7 @@ if __name__ == '__main__':
     app = QApplication(sys.argv)
     # HighDPI scaling is not needed for linuxfb, and may cause issues; removed.
 
-    window = PulmoAIMainWindow()
+    window = ThoracisoAIMainWindow()
     # Optionally force the window to fill the screen (though showFullScreen should handle it)
     # screen = QApplication.primaryScreen()
     # window.setGeometry(0, 0, screen.size().width(), screen.size().height())
