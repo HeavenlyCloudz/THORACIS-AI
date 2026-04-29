@@ -64,7 +64,7 @@ import scipy.signal
 # =============================================================================
 # SYNC FOLDER CONFIGURATION (for Operation Oracle)
 # =============================================================================
-SYNC_FOLDER = Path("/home/pi/operation_oracle_data")
+SYNC_FOLDER = Path("/home/anik/operation_oracle_data")
 SYNC_FOLDER.mkdir(parents=True, exist_ok=True)
 
 # =============================================================================
@@ -73,7 +73,7 @@ SYNC_FOLDER.mkdir(parents=True, exist_ok=True)
 
 def init_thoracic_db():
     """Initialize the SQLite database for thoracic longitudinal tracking"""
-    conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+    conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -492,7 +492,7 @@ class OperationOracleDashboard(QDialog):
         self.thoracic_list.clear()
         
         try:
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -549,7 +549,7 @@ class OperationOracleDashboard(QDialog):
                 self.save_skin_scan_to_db(scan)
             
             # Load from database
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             
             cursor.execute('''
@@ -578,7 +578,7 @@ class OperationOracleDashboard(QDialog):
     def save_skin_scan_to_db(self, scan_data):
         """Save incoming skin scan to database"""
         try:
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             
             diagnosis = scan_data.get('prediction', scan_data.get('diagnosis', 'Unknown'))
@@ -614,7 +614,7 @@ class OperationOracleDashboard(QDialog):
         alerts = []
         
         try:
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             
             # Check for high-risk thoracic scans
@@ -2439,7 +2439,7 @@ class ThoracisAIMainWindow(QMainWindow):
     def _update_cross_modal_summary(self):
         """Update the cross-modal summary text"""
         try:
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             
             # Get recent thoracic scans
@@ -2910,7 +2910,7 @@ class ThoracisAIMainWindow(QMainWindow):
         
         # Save to local database
         try:
-            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO thoracic_scans (patient_id, timestamp, diagnosis, confidence, microwave_result, audio_result, risk_level)
@@ -3132,7 +3132,7 @@ class ThoracisAIMainWindow(QMainWindow):
             
             # Save to database
             try:
-                conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+                conn = sqlite3.connect('/home/anik/thoracis_longitudinal.db')
                 cursor = conn.cursor()
                 risk_level = "HIGH" if clinical_result == 'tumor' else "LOW"
                 cursor.execute('''
