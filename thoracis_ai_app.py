@@ -2,11 +2,19 @@
 # -*- coding: utf-8 -*-
 """
 THORACIS AI - Operation Oracle: Democratized Lung Screening System
+Complete version with:
+- Fixed clinical assessment scrolling
+- Submit button working
+- Syncing with NOMA AI via Syncthing
+- Health Passport integration
+- Multi-angle microwave imaging
+- Acoustic analysis with YAMNet
+- Fusion diagnosis
 """
 
 import os
 
-# Needs to force OpenGL ES, as it must be set before any Qt imports
+# Force OpenGL ES - must be set before any Qt imports
 if 'QT_OPENGL' not in os.environ:
     os.environ['QT_OPENGL'] = 'es2'
 if 'QT_QPA_EGLFS_HIDECURSOR' not in os.environ:
@@ -51,17 +59,23 @@ from scipy.ndimage import gaussian_filter
 import scipy.signal
 
 # =============================================================================
+# SYNC FOLDER CONFIGURATION (for Operation Oracle)
+# =============================================================================
+SYNC_FOLDER = Path("/home/pi/operation_oracle_data")
+SYNC_FOLDER.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
 # CONFIGURATION
 # =============================================================================
 
-MODEL_DIR = Path.home() / "pulmo_ai_app" / "models"
+MODEL_DIR = Path.home() / "thoracis_ai_app" / "models"
 YAMNET_PATH = MODEL_DIR / "yamnet_working.tflite"
 AUDIO_MODEL_PATH = MODEL_DIR / "lung_audio.tflite"
 FUSION_MODEL_PATH = MODEL_DIR / "fusion_xgboost_model.pkl"
 FUSION_SCALER_PATH = MODEL_DIR / "fusion_scaler.pkl"
 
 # Data directories
-DATA_DIR = Path.home() / "pulmo_ai_app" / "scans"
+DATA_DIR = Path.home() / "thoracis_ai_app" / "scans"
 BASELINE_DIR = DATA_DIR / "baseline"
 PATIENT_DIR = DATA_DIR / "patient"
 MULTI_ANGLE_DIR = DATA_DIR / "multi_angle"
@@ -211,11 +225,57 @@ def add_time_domain_features(X):
     return X_augmented
 
 # =============================================================================
-# HEALTH PASSPORT - Patient Health Records
+# SYNC FUNCTIONS (Operation Oracle - Sharing with NOMA AI)
+# =============================================================================
+
+def sync_scan_to_noma(scan_data):
+    """
+    Save scan result to synced folder so NOMA AI can see it.
+    This creates a unified patient record across both devices.
+    """
+    try:
+        # Create filename with timestamp
+        filename = SYNC_FOLDER / f"thoracis_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.json"
+        
+        # Add metadata about which device sent it
+        scan_data['source_device'] = 'THORACIS_AI'
+        scan_data['scan_type'] = 'lung'
+        scan_data['sync_timestamp'] = datetime.now().isoformat()
+        
+        # Save JSON
+        with open(filename, 'w') as f:
+            json.dump(scan_data, f, indent=2)
+        
+        print(f"Scan synced to NOMA AI: {filename}")
+        return True
+    except Exception as e:
+        print(f"Sync error: {e}")
+        return False
+
+def check_for_skin_scans():
+    """
+    Check for incoming skin scans from NOMA AI.
+    Returns list of skin scan records.
+    """
+    skin_scans = []
+    try:
+        for json_file in SYNC_FOLDER.glob("noma_*.json"):
+            with open(json_file, 'r') as f:
+                scan = json.load(f)
+                if scan.get('scan_type') == 'skin':
+                    skin_scans.append(scan)
+            # Optionally move processed files to archive
+            # json_file.rename(SYNC_FOLDER / "archive" / json_file.name)
+    except Exception as e:
+        print(f"Error checking skin scans: {e}")
+    return skin_scans
+
+# =============================================================================
+# HEALTH PASSPORT - Patient Health Records (Enhanced with Cross-Modal Data)
 # =============================================================================
 
 class HealthPassportWidget(QWidget):
-    """Store and display patient health history across scans"""
+    """Store and display patient health history across scans, including skin data from NOMA AI"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -283,6 +343,19 @@ class HealthPassportWidget(QWidget):
         summary_layout.addWidget(self.recent_trend_label)
         
         layout.addWidget(summary_group)
+        
+        # Cross-modal alert (from NOMA AI)
+        self.cross_modal_alert = QLabel()
+        self.cross_modal_alert.setWordWrap(True)
+        self.cross_modal_alert.setStyleSheet("""
+            background-color: #fff3e0;
+            border: 2px solid #ff9800;
+            border-radius: 8px;
+            padding: 8px;
+            font-size: 11px;
+        """)
+        self.cross_modal_alert.hide()
+        layout.addWidget(self.cross_modal_alert)
         
         # Historical trends
         trends_group = QGroupBox("Health Trends")
@@ -366,7 +439,8 @@ class HealthPassportWidget(QWidget):
             if patient_id not in self.patient_records:
                 self.patient_records[patient_id] = {
                     'created': datetime.now().isoformat(),
-                    'scans': []
+                    'scans': [],
+                    'skin_scans': []  # For cross-modal data from NOMA AI
                 }
                 self._save_records()
                 self._refresh_patient_list()
@@ -378,11 +452,49 @@ class HealthPassportWidget(QWidget):
         self.current_patient_id = patient_name
         if patient_name and patient_name in self.patient_records:
             self._display_patient_records(patient_name)
+            self._check_cross_modal_alerts(patient_name)
+    
+    def _check_cross_modal_alerts(self, patient_name):
+        """Check for cross-modal alerts from NOMA AI skin scans"""
+        records = self.patient_records.get(patient_name, {})
+        skin_scans = records.get('skin_scans', [])
+        
+        if skin_scans:
+            # Check for high-risk skin findings
+            high_risk_scans = [s for s in skin_scans if s.get('risk_level') == 'high' or s.get('confidence', 0) > 0.7]
+            if high_risk_scans:
+                latest = high_risk_scans[-1]
+                self.cross_modal_alert.setText(
+                    f"⚠️ CROSS-MODAL ALERT\n"
+                    f"NOMA AI detected a high-risk skin lesion on {latest.get('date', 'unknown date')}.\n"
+                    f"Paraneoplastic syndrome possible. Consider integrated clinical evaluation."
+                )
+                self.cross_modal_alert.show()
+            else:
+                self.cross_modal_alert.hide()
+        else:
+            self.cross_modal_alert.hide()
+    
+    def add_skin_scan_from_sync(self, skin_scan_data):
+        """Add a skin scan received from NOMA AI via sync"""
+        if not self.current_patient_id:
+            # If no patient selected, create a default one
+            self._create_new_patient()
+        
+        if self.current_patient_id and self.current_patient_id in self.patient_records:
+            if 'skin_scans' not in self.patient_records[self.current_patient_id]:
+                self.patient_records[self.current_patient_id]['skin_scans'] = []
+            
+            self.patient_records[self.current_patient_id]['skin_scans'].append(skin_scan_data)
+            self._save_records()
+            self._check_cross_modal_alerts(self.current_patient_id)
+            self._display_patient_records(self.current_patient_id)
     
     def _display_patient_records(self, patient_name):
         """Display all records for a patient"""
         records = self.patient_records.get(patient_name, {})
         scans = records.get('scans', [])
+        skin_scans = records.get('skin_scans', [])
         
         if not scans:
             self.recent_date_label.setText("No scans recorded")
@@ -390,38 +502,36 @@ class HealthPassportWidget(QWidget):
             self.recent_confidence_label.setText("")
             self.recent_trend_label.setText("")
             self.trends_text.clear()
-            self.history_table.clear()
-            return
-        
-        # Most recent scan
-        latest = scans[-1]
-        scan_date = latest.get('date', 'Unknown')
-        dx = latest.get('diagnosis', 'Unknown')
-        confidence = latest.get('confidence', 0)
-        
-        self.recent_date_label.setText(f"Date: {scan_date[:16]}")
-        self.recent_dx_label.setText(f"Diagnosis: {dx.upper()}")
-        self.recent_confidence_label.setText(f"Confidence: {confidence:.1%}")
-        
-        # Show trend
-        if len(scans) >= 2:
-            prev = scans[-2]
-            prev_dx = prev.get('diagnosis', 'Unknown')
-            if prev_dx == dx:
-                self.recent_trend_label.setText("Trend: Stable (same diagnosis)")
-                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #4caf50;")
-            else:
-                self.recent_trend_label.setText(f"Trend: Changed from {prev_dx.upper()} to {dx.upper()}")
-                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #ff9800;")
         else:
-            self.recent_trend_label.setText("First scan - baseline established")
-            self.recent_trend_label.setStyleSheet("font-size: 11px; color: #2196f3;")
+            # Most recent scan
+            latest = scans[-1]
+            scan_date = latest.get('date', 'Unknown')
+            dx = latest.get('diagnosis', 'Unknown')
+            confidence = latest.get('confidence', 0)
+            
+            self.recent_date_label.setText(f"Date: {scan_date[:16]}")
+            self.recent_dx_label.setText(f"Diagnosis: {dx.upper()}")
+            self.recent_confidence_label.setText(f"Confidence: {confidence:.1%}")
+            
+            # Show trend
+            if len(scans) >= 2:
+                prev = scans[-2]
+                prev_dx = prev.get('diagnosis', 'Unknown')
+                if prev_dx == dx:
+                    self.recent_trend_label.setText("Trend: Stable (same diagnosis)")
+                    self.recent_trend_label.setStyleSheet("font-size: 11px; color: #4caf50;")
+                else:
+                    self.recent_trend_label.setText(f"Trend: Changed from {prev_dx.upper()} to {dx.upper()}")
+                    self.recent_trend_label.setStyleSheet("font-size: 11px; color: #ff9800;")
+            else:
+                self.recent_trend_label.setText("First scan - baseline established")
+                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #2196f3;")
+            
+            # Generate trend analysis
+            self._update_trend_analysis(scans)
         
-        # Generate trend analysis
-        self._update_trend_analysis(scans)
-        
-        # Update history table
-        self._update_history_table(scans)
+        # Update history table (including skin scans if available)
+        self._update_history_table(scans, skin_scans)
     
     def _update_trend_analysis(self, scans):
         """Analyze health trends over time"""
@@ -429,17 +539,11 @@ class HealthPassportWidget(QWidget):
             self.trends_text.setText("Not enough data for trend analysis.\nComplete more scans to see trends.")
             return
         
-        # Count diagnoses over time
-        dx_counts = {}
-        for scan in scans:
-            dx = scan.get('diagnosis', 'Unknown')
-            dx_counts[dx] = dx_counts.get(dx, 0) + 1
+        trend_text = ""
         
         # Calculate trend
         recent_3 = scans[-3:] if len(scans) >= 3 else scans
         recent_dxs = [s.get('diagnosis', 'Unknown') for s in recent_3]
-        
-        trend_text = ""
         
         # Check for improvement/deterioration
         if 'pneumonia' in recent_dxs and 'healthy' not in recent_dxs:
@@ -459,57 +563,38 @@ class HealthPassportWidget(QWidget):
             elif first_dx == 'healthy' and last_dx != 'healthy':
                 trend_text += "- Health decline detected - consult provider\n"
         
-        # Add stability assessment
-        unique_dxs = len(set([s.get('diagnosis', 'Unknown') for s in scans]))
-        if unique_dxs == 1:
-            trend_text += f"- Consistent {scans[0].get('diagnosis', 'Unknown').upper()} diagnosis across all scans\n"
-        elif unique_dxs <= 2:
-            trend_text += "- Relatively stable health pattern\n"
-        else:
-            trend_text += "- Variable health pattern - discuss with provider\n"
-        
-        # Add compliance note
-        if len(scans) >= 2:
-            try:
-                first_date = datetime.fromisoformat(scans[0].get('date', ''))
-                last_date = datetime.fromisoformat(scans[-1].get('date', ''))
-                days_span = (last_date - first_date).days
-                if days_span > 0:
-                    scans_per_month = len(scans) / (days_span / 30)
-                    if scans_per_month >= 1:
-                        trend_text += f"- Good monitoring frequency ({scans_per_month:.1f} scans/month)\n"
-                    else:
-                        trend_text += "- Consider more frequent monitoring\n"
-            except:
-                pass
-        
         self.trends_text.setText(trend_text)
     
-    def _update_history_table(self, scans):
+    def _update_history_table(self, scans, skin_scans):
         """Display scan history in table format"""
-        if not scans:
+        if not scans and not skin_scans:
+            self.history_table.setText("No scans recorded")
             return
         
         # Create table header
-        table = "Date                 | Diagnosis      | Confidence | MW Result    | Audio Result\n"
+        table = "Date                 | Type      | Diagnosis      | Confidence | Result\n"
         table += "-" * 80 + "\n"
         
-        # Show last 10 scans (most recent first)
-        for scan in reversed(scans[-10:]):
+        # Show lung scans
+        for scan in reversed(scans[-5:]):
             date = scan.get('date', 'Unknown')[:16]
             dx = scan.get('diagnosis', 'Unknown')[:14]
             conf = f"{scan.get('confidence', 0):.0%}"
-            mw = scan.get('microwave_result', 'Unknown')[:12]
-            audio = scan.get('audio_result', 'Unknown')[:12]
-            
-            table += f"{date:20s} {dx:14s} {conf:10s} {mw:14s} {audio:12s}\n"
+            table += f"{date:20s} | Lung      | {dx:14s} | {conf:10s} |\n"
+        
+        # Show skin scans from NOMA AI
+        for scan in reversed(skin_scans[-3:]):
+            date = scan.get('date', 'Unknown')[:16]
+            dx = scan.get('diagnosis', 'Unknown')[:14]
+            conf = f"{scan.get('confidence', 0):.0%}"
+            risk = scan.get('risk_level', 'unknown')[:8]
+            table += f"{date:20s} | Skin      | {dx:14s} | {conf:10s} | Risk: {risk}\n"
         
         self.history_table.setText(table)
     
     def add_scan_record(self, diagnosis, confidence, microwave_result, audio_result, audio_probs=None):
         """Add a new scan record for the current patient"""
         if not self.current_patient_id or self.current_patient_id not in self.patient_records:
-            # Auto-create patient if none exists
             if not self.current_patient_id:
                 self._create_new_patient()
                 if not self.current_patient_id:
@@ -517,7 +602,8 @@ class HealthPassportWidget(QWidget):
             if self.current_patient_id not in self.patient_records:
                 self.patient_records[self.current_patient_id] = {
                     'created': datetime.now().isoformat(),
-                    'scans': []
+                    'scans': [],
+                    'skin_scans': []
                 }
         
         # Create scan record
@@ -543,7 +629,6 @@ class HealthPassportWidget(QWidget):
             QMessageBox.warning(self, "No Patient", "No patient selected")
             return
         
-        # Ask for save location
         filepath, _ = QFileDialog.getSaveFileName(
             self, "Save Health Report", 
             f"{self.current_patient_id}_health_report.csv",
@@ -553,17 +638,26 @@ class HealthPassportWidget(QWidget):
         if filepath:
             records = self.patient_records[self.current_patient_id]
             scans = records.get('scans', [])
+            skin_scans = records.get('skin_scans', [])
             
             with open(filepath, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Date', 'Diagnosis', 'Confidence', 'Microwave Result', 'Audio Result'])
+                writer.writerow(['Date', 'Scan Type', 'Diagnosis', 'Confidence', 'Details'])
                 for scan in scans:
                     writer.writerow([
                         scan.get('date', ''),
+                        'Lung',
                         scan.get('diagnosis', ''),
                         scan.get('confidence', ''),
-                        scan.get('microwave_result', ''),
-                        scan.get('audio_result', '')
+                        scan.get('microwave_result', '')
+                    ])
+                for scan in skin_scans:
+                    writer.writerow([
+                        scan.get('date', ''),
+                        'Skin',
+                        scan.get('diagnosis', ''),
+                        scan.get('confidence', ''),
+                        f"Risk: {scan.get('risk_level', 'unknown')}"
                     ])
             
             QMessageBox.information(self, "Export Complete", f"Report saved to {filepath}")
@@ -823,7 +917,7 @@ class EnhancedClinicalDecisionSupport:
         return explanation
 
 # =============================================================================
-# CLINICAL ASSESSMENT WIDGET
+# CLINICAL ASSESSMENT WIDGET (FIXED SCROLLING)
 # =============================================================================
 
 class ClinicalAssessmentWidget(QFrame):
@@ -858,13 +952,33 @@ class ClinicalAssessmentWidget(QFrame):
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
+        # Create scroll area with proper settings for all questions to be visible
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("border: none; background-color: transparent;")
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #f0f0f0;
+                width: 10px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #ffb74d;
+                min-height: 20px;
+                border-radius: 5px;
+            }
+        """)
         
         content_widget = QWidget()
         self.form_layout = QVBoxLayout(content_widget)
-        self.form_layout.setSpacing(15)
+        self.form_layout.setSpacing(20)
+        self.form_layout.setContentsMargins(10, 10, 10, 10)
         
         # Question 1: Breathing Difficulty
         self._add_question("1. How would you describe your breathing difficulty?",
@@ -912,8 +1026,12 @@ class ClinicalAssessmentWidget(QFrame):
                            "Worse when lying down"],
                           "symptom_pattern")
         
+        # Add stretch to push content up, but keep submit button visible
+        self.form_layout.addStretch()
+        
+        # Submit button - always visible at bottom
         self.submit_btn = QPushButton("SUBMIT ASSESSMENT")
-        self.submit_btn.setMinimumHeight(40)
+        self.submit_btn.setMinimumHeight(45)
         self.submit_btn.setStyleSheet("""
             QPushButton {
                 font-size: 14px;
@@ -922,7 +1040,7 @@ class ClinicalAssessmentWidget(QFrame):
                 color: white;
                 border: none;
                 border-radius: 10px;
-                padding: 8px;
+                padding: 10px;
                 margin-top: 10px;
             }
             QPushButton:hover { background: #f57c00; }
@@ -936,8 +1054,17 @@ class ClinicalAssessmentWidget(QFrame):
     def _add_question(self, question, options, key, multi_select=False):
         """Add a question to the form"""
         group = QGroupBox(question)
-        group.setStyleSheet("QGroupBox { font-weight: bold; margin-top: 10px; }")
+        group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                margin-top: 5px;
+                border: 1px solid #ddd;
+                border-radius: 8px;
+                padding-top: 10px;
+            }
+        """)
         layout = QVBoxLayout(group)
+        layout.setSpacing(8)
         
         if multi_select:
             buttons = []
@@ -1819,7 +1946,7 @@ class FusionClassifier:
         return pred, np.max(proba)
 
 # =============================================================================
-# MAIN GUI APPLICATION
+# MAIN GUI APPLICATION - THORACIS AI
 # =============================================================================
 
 class ThoracisAIMainWindow(QMainWindow):
@@ -1842,6 +1969,11 @@ class ThoracisAIMainWindow(QMainWindow):
         # Health Passport
         self.health_passport = HealthPassportWidget()
         
+        # Sync timer to check for incoming skin scans
+        self.sync_timer = QTimer()
+        self.sync_timer.timeout.connect(self._check_sync_folder)
+        self.sync_timer.start(5000)  # Check every 5 seconds
+        
         try:
             self.fusion = FusionClassifier()
         except Exception as e:
@@ -1857,6 +1989,15 @@ class ThoracisAIMainWindow(QMainWindow):
         
         self._setup_ui()
         self.showFullScreen()
+    
+    def _check_sync_folder(self):
+        """Check for incoming skin scan data from NOMA AI"""
+        skin_scans = check_for_skin_scans()
+        for scan in skin_scans:
+            # Add to health passport
+            self.health_passport.add_skin_scan_from_sync(scan)
+            # Show notification
+            self.status_bar.setText(f"Received skin scan from NOMA AI: {scan.get('diagnosis', 'Unknown')}")
     
     def _setup_audio_device(self):
         try:
@@ -1909,7 +2050,7 @@ class ThoracisAIMainWindow(QMainWindow):
         
         vna_status = "Connected" if self.vna.serial_conn else "Disconnected"
         audio_status = "USB" if self.audio_device_id is not None else "Default"
-        self.status_bar = QLabel(f"VNA: {vna_status} | Audio: {audio_status} | Multi-Angle: {len(ROTATION_ANGLES)} positions")
+        self.status_bar = QLabel(f"VNA: {vna_status} | Audio: {audio_status} | Multi-Angle: {len(ROTATION_ANGLES)} positions | Sync: Active")
         self.status_bar.setStyleSheet("font-size: 11px; color: #666; padding: 5px; background: #f0f0f0; border-radius: 8px;")
         left_layout.addWidget(self.status_bar)
         
@@ -2449,6 +2590,16 @@ class ThoracisAIMainWindow(QMainWindow):
             audio_probs=final_probs
         )
         
+        # Sync to NOMA AI
+        sync_data = {
+            'diagnosis': final_dx,
+            'confidence': confidence,
+            'timestamp': datetime.now().isoformat(),
+            'scan_type': 'lung',
+            'source': 'THORACIS_AI'
+        }
+        sync_scan_to_noma(sync_data)
+        
         if self.current_mw_features is not None and self.fusion is not None:
             self.fusion_combine_btn.setEnabled(True)
     
@@ -2767,6 +2918,18 @@ class ThoracisAIMainWindow(QMainWindow):
                 audio_result=audio_class,
                 audio_probs=self.current_audio_probs
             )
+            
+            # Sync to NOMA AI
+            sync_data = {
+                'diagnosis': clinical_result,
+                'confidence': conf,
+                'microwave_finding': microwave_text,
+                'audio_finding': audio_class,
+                'timestamp': datetime.now().isoformat(),
+                'scan_type': 'lung_fusion',
+                'source': 'THORACIS_AI'
+            }
+            sync_scan_to_noma(sync_data)
             
         except Exception as e:
             self.fusion_result.setText(f"Fusion error: {e}")
