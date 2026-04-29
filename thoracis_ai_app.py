@@ -3,13 +3,13 @@
 """
 THORACIS AI - Operation Oracle: Democratized Lung Screening System
 Complete version with:
+- Operation Oracle unified dashboard tab
+- Cross-modal alerts with NOMA AI
 - Fixed clinical assessment scrolling
-- Submit button working
-- Syncing with NOMA AI via Syncthing
-- Health Passport integration
 - Multi-angle microwave imaging
 - Acoustic analysis with YAMNet
 - Fusion diagnosis
+- Health Passport integration
 """
 
 import os
@@ -27,12 +27,14 @@ import threading
 import serial
 import numpy as np
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import pickle
 import math
 import traceback
 import csv
+import sqlite3
+import hashlib
 
 # Qt
 from PySide6 import QtWidgets, QtGui, QtCore
@@ -42,7 +44,8 @@ from PySide6.QtWidgets import (
     QMainWindow, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QWidget, QProgressBar, QMessageBox, QTabWidget, QTextEdit,
     QFrame, QScrollArea, QGroupBox, QRadioButton, QButtonGroup,
-    QCheckBox, QComboBox, QFileDialog, QInputDialog
+    QCheckBox, QComboBox, QFileDialog, QInputDialog, QListWidget,
+    QListWidgetItem, QDialog, QDialogButtonBox
 )
 
 # Hardware
@@ -63,6 +66,82 @@ import scipy.signal
 # =============================================================================
 SYNC_FOLDER = Path("/home/pi/operation_oracle_data")
 SYNC_FOLDER.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# LONGITUDINAL TRACKING DATABASE SETUP
+# =============================================================================
+
+def init_thoracic_db():
+    """Initialize the SQLite database for thoracic longitudinal tracking"""
+    conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS thoracic_scans (
+        scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        patient_id TEXT,
+        timestamp TEXT,
+        diagnosis TEXT,
+        confidence REAL,
+        microwave_result TEXT,
+        audio_result TEXT,
+        localization TEXT,
+        risk_level TEXT
+    )
+    ''')
+    
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS skin_scans_received (
+        scan_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT,
+        diagnosis TEXT,
+        confidence REAL,
+        risk_level TEXT,
+        source TEXT,
+        raw_data TEXT
+    )
+    ''')
+    
+    conn.commit()
+    conn.close()
+    print("Thoracic longitudinal database initialized")
+
+init_thoracic_db()
+
+def sync_scan_to_noma(scan_data):
+    """Save scan result to synced folder so NOMA AI can see it"""
+    try:
+        filename = SYNC_FOLDER / f"thoracis_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.json"
+        
+        scan_data['source_device'] = 'THORACIS_AI'
+        scan_data['scan_type'] = 'lung'
+        scan_data['timestamp'] = datetime.now().isoformat()
+        
+        with open(filename, 'w') as f:
+            json.dump(scan_data, f, indent=2)
+        
+        print(f"Scan synced to NOMA AI: {filename}")
+        return True
+    except Exception as e:
+        print(f"Sync error: {e}")
+        return False
+
+def check_for_skin_scans():
+    """Check for incoming skin scans from NOMA AI"""
+    skin_scans = []
+    try:
+        for json_file in SYNC_FOLDER.glob("noma_*.json"):
+            with open(json_file, 'r') as f:
+                scan = json.load(f)
+                if scan.get('scan_type') == 'skin' or scan.get('type') == 'skin_scan':
+                    skin_scans.append(scan)
+            # Archive processed file
+            archive_dir = SYNC_FOLDER / "archive"
+            archive_dir.mkdir(exist_ok=True)
+            json_file.rename(archive_dir / json_file.name)
+    except Exception as e:
+        print(f"Error checking skin scans: {e}")
+    return skin_scans
 
 # =============================================================================
 # CONFIGURATION
@@ -123,13 +202,13 @@ SAMPLE_RATE = 16000
 RECORD_SECONDS = 3
 EXPECTED_AUDIO_SAMPLES = SAMPLE_RATE * RECORD_SECONDS
 
-# Feature dimensions - CRITICAL: Must match training!
-N_FREQ_POINTS = POINTS  # 201
+# Feature dimensions
+N_FREQ_POINTS = POINTS
 N_PATHS = 4
-N_FREQ_FEATURES = N_PATHS * N_FREQ_POINTS  # 804
+N_FREQ_FEATURES = N_PATHS * N_FREQ_POINTS
 N_TIME_FEATURES_PER_PATH = 9
-N_TIME_FEATURES = N_PATHS * N_TIME_FEATURES_PER_PATH  # 36
-TOTAL_FEATURES = N_FREQ_FEATURES + N_TIME_FEATURES  # 840
+N_TIME_FEATURES = N_PATHS * N_TIME_FEATURES_PER_PATH
+TOTAL_FEATURES = N_FREQ_FEATURES + N_TIME_FEATURES
 
 # Model class order from training
 MODEL_CLASSES = ['bronchial', 'asthma', 'copd', 'healthy', 'pneumonia']
@@ -175,46 +254,34 @@ def linear_to_db(linear):
     return 10 * np.log10(linear)
 
 def add_time_domain_features(X):
-    """
-    Add time-domain features via IFFT using magnitude-only data.
-    This matches your training pipeline exactly.
-    
-    Input: X shape (n_samples, 804) - magnitude values in dB
-    Output: X_augmented shape (n_samples, 840) - 804 freq + 36 time features
-    """
+    """Add time-domain features via IFFT using magnitude-only data."""
     n_samples, n_features = X.shape
-    n_freq = n_features  # 804 features = 4 paths * 201 freq points
+    n_freq = n_features
     n_paths = 4
-    freq_per_path = n_freq // n_paths  # 201
+    freq_per_path = n_freq // n_paths
     
     time_features = []
     
     for sample in X:
         sample_time_features = []
         for path in range(n_paths):
-            # Extract this path's frequency response
             start_idx = path * freq_per_path
             end_idx = (path + 1) * freq_per_path
             freq_response = sample[start_idx:end_idx]
-            
-            # Convert from dB to linear magnitude
             freq_response_linear = db_to_linear(freq_response)
-            
-            # IFFT to get time domain (magnitude-only, but consistent with training)
             time_response = np.fft.ifft(freq_response_linear)
             time_magnitude = np.abs(time_response)
             
-            # Extract time-domain features
             sample_time_features.extend([
-                np.max(time_magnitude),          # Peak in time domain
-                np.argmax(time_magnitude),       # Location of peak
-                np.mean(time_magnitude),         # Average energy
-                np.std(time_magnitude),          # Variation
-                np.percentile(time_magnitude, 90),  # 90th percentile
-                np.percentile(time_magnitude, 10),  # 10th percentile
-                np.sum(time_magnitude),          # Total energy
-                np.max(time_magnitude) - np.min(time_magnitude),  # Range
-                np.sum(np.square(time_magnitude)),  # Energy
+                np.max(time_magnitude),
+                np.argmax(time_magnitude),
+                np.mean(time_magnitude),
+                np.std(time_magnitude),
+                np.percentile(time_magnitude, 90),
+                np.percentile(time_magnitude, 10),
+                np.sum(time_magnitude),
+                np.max(time_magnitude) - np.min(time_magnitude),
+                np.sum(np.square(time_magnitude)),
             ])
         
         time_features.append(sample_time_features)
@@ -225,57 +292,412 @@ def add_time_domain_features(X):
     return X_augmented
 
 # =============================================================================
-# SYNC FUNCTIONS (Operation Oracle - Sharing with NOMA AI)
+# OPERATION ORACLE DASHBOARD TAB
 # =============================================================================
 
-def sync_scan_to_noma(scan_data):
-    """
-    Save scan result to synced folder so NOMA AI can see it.
-    This creates a unified patient record across both devices.
-    """
-    try:
-        # Create filename with timestamp
-        filename = SYNC_FOLDER / f"thoracis_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]}.json"
+class OperationOracleDashboard(QDialog):
+    """Unified dashboard showing data from both Thoracis AI and NOMA AI"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_app = parent
+        self.setWindowTitle("Operation Oracle - Unified Patient Record")
+        self.setMinimumSize(800, 600)
+        self.setStyleSheet("""
+            QDialog { background-color: #e8f5e9; }
+            QLabel { font-size: 14px; }
+            QListWidget { 
+                background-color: white; 
+                border: 2px solid #4fc3f7; 
+                border-radius: 10px; 
+                padding: 10px; 
+                font-size: 13px; 
+            }
+            QGroupBox { 
+                font-size: 16px; 
+                font-weight: bold; 
+                border: 2px solid #4fc3f7; 
+                border-radius: 8px; 
+                margin-top: 12px; 
+                padding-top: 10px; 
+            }
+            QGroupBox::title { 
+                subcontrol-origin: margin; 
+                left: 10px; 
+                padding: 0 5px 0 5px; 
+            }
+            QPushButton { 
+                font-size: 14px; 
+                font-weight: bold; 
+                padding: 8px 16px; 
+                border-radius: 8px; 
+            }
+            QTextEdit { 
+                background-color: #f5f5f5; 
+                border: 2px solid #4fc3f7; 
+                border-radius: 8px; 
+                font-size: 13px; 
+            }
+        """)
         
-        # Add metadata about which device sent it
-        scan_data['source_device'] = 'THORACIS_AI'
-        scan_data['scan_type'] = 'lung'
-        scan_data['sync_timestamp'] = datetime.now().isoformat()
+        main_layout = QVBoxLayout()
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 15, 15, 15)
         
-        # Save JSON
-        with open(filename, 'w') as f:
-            json.dump(scan_data, f, indent=2)
+        # Title bar with back button
+        title_bar = QWidget()
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(0, 0, 0, 0)
         
-        print(f"Scan synced to NOMA AI: {filename}")
-        return True
-    except Exception as e:
-        print(f"Sync error: {e}")
-        return False
+        self.back_button = QPushButton("BACK")
+        self.back_button.setStyleSheet("""
+            QPushButton {
+                background-color: #ffb74d;
+                color: #e65100;
+                padding: 8px 20px;
+                font-size: 14px;
+                font-weight: bold;
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background-color: #ffcc80;
+            }
+        """)
+        self.back_button.clicked.connect(self.accept)
+        title_layout.addWidget(self.back_button)
+        
+        title_layout.addStretch(1)
+        
+        title = QLabel("OPERATION ORACLE")
+        title.setStyleSheet("font-size: 28px; font-weight: bold; color: #0277bd;")
+        title.setAlignment(Qt.AlignCenter)
+        title_layout.addWidget(title)
+        
+        title_layout.addStretch(1)
+        
+        refresh_btn = QPushButton("REFRESH")
+        refresh_btn.setStyleSheet("background-color: #4fc3f7; color: white;")
+        refresh_btn.clicked.connect(self.refresh_data)
+        title_layout.addWidget(refresh_btn)
+        
+        main_layout.addWidget(title_bar)
+        
+        subtitle = QLabel("Unified Patient Record | Cross-Modal Monitoring")
+        subtitle.setStyleSheet("font-size: 14px; color: #0277bd; margin-bottom: 10px;")
+        subtitle.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(subtitle)
+        
+        # Tab widget
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane { 
+                border: 2px solid #4fc3f7; 
+                border-radius: 10px; 
+                background-color: rgba(255,255,255,0.5); 
+            }
+            QTabBar::tab { 
+                font-size: 14px; 
+                padding: 8px 16px; 
+                background-color: #e1f5fe; 
+                border-radius: 8px; 
+                margin: 2px; 
+            }
+            QTabBar::tab:selected { 
+                background-color: #4fc3f7; 
+                font-weight: bold; 
+                color: white;
+            }
+        """)
+        
+        # Thoracic Scans Tab
+        thoracic_tab = QWidget()
+        thoracic_layout = QVBoxLayout(thoracic_tab)
+        
+        thoracic_label = QLabel("Thoracic Scans (Lung Assessment)")
+        thoracic_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #0277bd;")
+        thoracic_layout.addWidget(thoracic_label)
+        
+        self.thoracic_list = QListWidget()
+        self.thoracic_list.itemClicked.connect(self.on_thoracic_scan_selected)
+        thoracic_layout.addWidget(self.thoracic_list)
+        
+        self.thoracic_detail = QTextEdit()
+        self.thoracic_detail.setReadOnly(True)
+        self.thoracic_detail.setMaximumHeight(150)
+        thoracic_layout.addWidget(self.thoracic_detail)
+        
+        self.tab_widget.addTab(thoracic_tab, "Thoracic Scans")
+        
+        # Skin Scans Tab (from NOMA AI)
+        skin_tab = QWidget()
+        skin_layout = QVBoxLayout(skin_tab)
+        
+        skin_label = QLabel("Skin Scans (from NOMA AI)")
+        skin_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #0277bd;")
+        skin_layout.addWidget(skin_label)
+        
+        self.skin_list = QListWidget()
+        self.skin_list.itemClicked.connect(self.on_skin_scan_selected)
+        skin_layout.addWidget(self.skin_list)
+        
+        self.skin_detail = QTextEdit()
+        self.skin_detail.setReadOnly(True)
+        self.skin_detail.setMaximumHeight(150)
+        skin_layout.addWidget(self.skin_detail)
+        
+        self.tab_widget.addTab(skin_tab, "Skin Scans")
+        
+        # Cross-Modal Alerts Tab
+        alerts_tab = QWidget()
+        alerts_layout = QVBoxLayout(alerts_tab)
+        
+        alerts_label = QLabel("Cross-Modal Clinical Alerts")
+        alerts_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #d32f2f;")
+        alerts_layout.addWidget(alerts_label)
+        
+        self.alerts_list = QListWidget()
+        alerts_layout.addWidget(self.alerts_list)
+        
+        self.tab_widget.addTab(alerts_tab, "Alerts")
+        
+        main_layout.addWidget(self.tab_widget)
+        
+        # Disclaimer
+        disclaimer = QLabel(
+            "DISCLAIMER: This is an AI-assisted screening tool. Not a substitute for professional medical diagnosis.\n"
+            "Operation Oracle | Democratizing Early Detection"
+        )
+        disclaimer.setWordWrap(True)
+        disclaimer.setStyleSheet("font-size: 10px; color: #666; margin-top: 10px;")
+        disclaimer.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(disclaimer)
+        
+        # Close button
+        close_btn = QPushButton("CLOSE DASHBOARD")
+        close_btn.setStyleSheet("background-color: #ef5350; color: white; padding: 10px; font-size: 16px;")
+        close_btn.clicked.connect(self.accept)
+        main_layout.addWidget(close_btn)
+        
+        self.setLayout(main_layout)
+        self.refresh_data()
+    
+    def refresh_data(self):
+        """Refresh all data displays"""
+        self.load_thoracic_scans()
+        self.load_skin_scans()
+        self.load_cross_modal_alerts()
+    
+    def load_thoracic_scans(self):
+        """Load thoracic scans from local database"""
+        self.thoracic_list.clear()
+        
+        try:
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT timestamp, diagnosis, confidence, risk_level, microwave_result, audio_result
+                FROM thoracic_scans
+                ORDER BY timestamp DESC
+                LIMIT 20
+            ''')
+            
+            scans = cursor.fetchall()
+            conn.close()
+            
+            for scan in scans:
+                timestamp, diagnosis, confidence, risk_level, mw_result, audio_result = scan
+                risk_indicator = "[URGENT]" if risk_level == "URGENT" else "[HIGH]" if risk_level == "HIGH" else "[LOW]"
+                item_text = f"{risk_indicator} {timestamp[:16]} - {diagnosis}"
+                self.thoracic_list.addItem(item_text)
+                # Store full data
+                self.thoracic_list.item(self.thoracic_list.count() - 1).setData(
+                    Qt.UserRole, {'timestamp': timestamp, 'diagnosis': diagnosis, 
+                                  'confidence': confidence, 'risk_level': risk_level,
+                                  'microwave_result': mw_result, 'audio_result': audio_result}
+                )
+            
+            if len(scans) == 0:
+                self.thoracic_list.addItem("No thoracic scans recorded yet")
+                
+        except Exception as e:
+            self.thoracic_list.addItem(f"Error loading scans: {str(e)}")
+    
+    def on_thoracic_scan_selected(self, item):
+        """Show detailed thoracic scan findings"""
+        scan_data = item.data(Qt.UserRole)
+        if scan_data:
+            detail_html = f"""
+            <h3 style='color:#0277bd;'>Thoracic Assessment Details</h3>
+            <p><b>Date:</b> {scan_data['timestamp'][:16]}</p>
+            <p><b>Diagnosis:</b> {scan_data['diagnosis'].upper()}</p>
+            <p><b>Confidence:</b> {scan_data['confidence']:.1%}</p>
+            <p><b>Risk Level:</b> {scan_data.get('risk_level', 'Unknown')}</p>
+            <p><b>Microwave Finding:</b> {scan_data.get('microwave_result', 'Unknown')}</p>
+            <p><b>Acoustic Finding:</b> {scan_data.get('audio_result', 'Unknown')}</p>
+            """
+            self.thoracic_detail.setHtml(detail_html)
+    
+    def load_skin_scans(self):
+        """Load skin scans received from NOMA AI"""
+        self.skin_list.clear()
+        
+        try:
+            # Also check the sync folder for any pending scans
+            new_skin_scans = check_for_skin_scans()
+            for scan in new_skin_scans:
+                self.save_skin_scan_to_db(scan)
+            
+            # Load from database
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT timestamp, diagnosis, confidence, risk_level
+                FROM skin_scans_received
+                ORDER BY timestamp DESC
+                LIMIT 20
+            ''')
+            
+            scans = cursor.fetchall()
+            conn.close()
+            
+            for scan in scans:
+                timestamp, diagnosis, confidence, risk_level = scan
+                risk_indicator = "[URGENT]" if risk_level in ['URGENT', 'HIGH'] else "[LOW]"
+                item_text = f"{risk_indicator} {timestamp[:16]} - {diagnosis}"
+                self.skin_list.addItem(item_text)
+            
+            if len(scans) == 0:
+                self.skin_list.addItem("No skin scans received from NOMA AI yet")
+                self.skin_list.addItem("Scans will appear here automatically when NOMA AI shares them")
+                
+        except Exception as e:
+            self.skin_list.addItem(f"Error loading skin scans: {str(e)}")
+    
+    def save_skin_scan_to_db(self, scan_data):
+        """Save incoming skin scan to database"""
+        try:
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            
+            diagnosis = scan_data.get('prediction', scan_data.get('diagnosis', 'Unknown'))
+            confidence = scan_data.get('confidence', 0.0)
+            risk_level = scan_data.get('risk_level', scan_data.get('risk_level', 'LOW'))
+            timestamp = scan_data.get('timestamp', datetime.now().isoformat())
+            
+            cursor.execute('''
+                INSERT INTO skin_scans_received (timestamp, diagnosis, confidence, risk_level, source, raw_data)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (timestamp, diagnosis, confidence, risk_level, 'NOMA_AI', json.dumps(scan_data)))
+            
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error saving skin scan: {e}")
+    
+    def on_skin_scan_selected(self, item):
+        """Show detailed skin scan findings"""
+        detail_html = """
+        <h3 style='color:#0277bd;'>Skin Assessment Details</h3>
+        <p>This skin scan was received from NOMA AI via automatic syncing.</p>
+        <p>Cross-modal correlation helps detect paraneoplastic syndromes where lung and skin findings co-occur.</p>
+        <p><b>Clinical Note:</b> Paraneoplastic syndromes can present with both thoracic obstruction and skin lesions.</p>
+        <p>Consider integrated pulmonary-dermatology evaluation when both systems show abnormalities.</p>
+        """
+        self.skin_detail.setHtml(detail_html)
+    
+    def load_cross_modal_alerts(self):
+        """Generate clinically meaningful cross-modal alerts"""
+        self.alerts_list.clear()
+        
+        alerts = []
+        
+        try:
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            
+            # Check for high-risk thoracic scans
+            thirty_days_ago = (datetime.now() - timedelta(days=30)).isoformat()
+            
+            cursor.execute('''
+                SELECT timestamp, diagnosis, confidence, risk_level
+                FROM thoracic_scans
+                WHERE risk_level IN ('HIGH', 'URGENT')
+                AND timestamp > ?
+                ORDER BY timestamp DESC
+            ''', (thirty_days_ago,))
+            
+            high_risk_thoracic = cursor.fetchall()
+            
+            # Check for high-risk skin scans
+            cursor.execute('''
+                SELECT timestamp, diagnosis, confidence, risk_level
+                FROM skin_scans_received
+                WHERE risk_level IN ('HIGH', 'URGENT')
+                AND timestamp > ?
+                ORDER BY timestamp DESC
+            ''', (thirty_days_ago,))
+            
+            high_risk_skin = cursor.fetchall()
+            
+            conn.close()
+            
+            # Generate alerts
+            if high_risk_thoracic:
+                for scan in high_risk_thoracic[:3]:
+                    timestamp, diagnosis, confidence, risk_level = scan
+                    alerts.append(f"HIGH RISK THORACIC FINDING on {timestamp[:10]}: {diagnosis} - Further evaluation recommended")
+            
+            if high_risk_skin:
+                for scan in high_risk_skin[:3]:
+                    timestamp, diagnosis, confidence, risk_level = scan
+                    alerts.append(f"HIGH RISK SKIN LESION detected on {timestamp[:10]}: {diagnosis} - Dermatology referral recommended")
+            
+            # PARANEOPLASTIC SYNDROME ALERT - This is the key clinical link
+            if high_risk_thoracic and high_risk_skin:
+                alerts.append("")
+                alerts.append("=== PARANEOPLASTIC SYNDROME ALERT ===")
+                alerts.append("Both thoracic AND skin high-risk findings detected.")
+                alerts.append("This combination raises concern for paraneoplastic syndrome.")
+                alerts.append("Common associated conditions include: Lung Cancer, Melanoma, Lymphoma.")
+                alerts.append("ACTION: Integrated pulmonology-dermatology consultation recommended immediately.")
+            elif high_risk_thoracic:
+                alerts.append("")
+                alerts.append("=== CLINICAL CORRELATION ADVISED ===")
+                alerts.append("High-risk thoracic findings detected. Skin assessment recommended.")
+                alerts.append("Paraneoplastic syndromes may manifest with skin changes.")
+                alerts.append("Consider complete skin examination by a dermatologist.")
+            elif high_risk_skin:
+                alerts.append("")
+                alerts.append("=== CLINICAL CORRELATION ADVISED ===")
+                alerts.append("High-risk skin findings detected. Thoracic assessment recommended.")
+                alerts.append("Consider pulmonary evaluation for possible underlying malignancy.")
+            
+            if not high_risk_thoracic and not high_risk_skin:
+                alerts.append("No active cross-modal alerts")
+                alerts.append("All recent scans within normal parameters")
+            
+        except Exception as e:
+            alerts.append(f"Error generating alerts: {str(e)}")
+        
+        for alert in alerts:
+            if alert.startswith("==="):
+                item = QListWidgetItem(alert)
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+                self.alerts_list.addItem(item)
+            else:
+                self.alerts_list.addItem(alert)
 
-def check_for_skin_scans():
-    """
-    Check for incoming skin scans from NOMA AI.
-    Returns list of skin scan records.
-    """
-    skin_scans = []
-    try:
-        for json_file in SYNC_FOLDER.glob("noma_*.json"):
-            with open(json_file, 'r') as f:
-                scan = json.load(f)
-                if scan.get('scan_type') == 'skin':
-                    skin_scans.append(scan)
-            # Optionally move processed files to archive
-            # json_file.rename(SYNC_FOLDER / "archive" / json_file.name)
-    except Exception as e:
-        print(f"Error checking skin scans: {e}")
-    return skin_scans
 
 # =============================================================================
-# HEALTH PASSPORT - Patient Health Records (Enhanced with Cross-Modal Data)
+# HEALTH PASSPORT WIDGET
 # =============================================================================
 
 class HealthPassportWidget(QWidget):
-    """Store and display patient health history across scans, including skin data from NOMA AI"""
+    """Store and display patient health history across scans"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -288,7 +710,6 @@ class HealthPassportWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
         
-        # Title
         title = QLabel("Health Passport")
         title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0277bd;")
         title.setAlignment(Qt.AlignCenter)
@@ -299,7 +720,7 @@ class HealthPassportWidget(QWidget):
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
-        # Patient selector / new patient
+        # Patient selector
         patient_row = QHBoxLayout()
         self.patient_combo = QComboBox()
         self.patient_combo.setMinimumWidth(150)
@@ -322,7 +743,7 @@ class HealthPassportWidget(QWidget):
         
         layout.addLayout(patient_row)
         
-        # Summary card for most recent scan
+        # Summary card
         summary_group = QGroupBox("Most Recent Assessment")
         summary_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         summary_layout = QVBoxLayout(summary_group)
@@ -344,7 +765,7 @@ class HealthPassportWidget(QWidget):
         
         layout.addWidget(summary_group)
         
-        # Cross-modal alert (from NOMA AI)
+        # Cross-modal alert
         self.cross_modal_alert = QLabel()
         self.cross_modal_alert.setWordWrap(True)
         self.cross_modal_alert.setStyleSheet("""
@@ -357,7 +778,7 @@ class HealthPassportWidget(QWidget):
         self.cross_modal_alert.hide()
         layout.addWidget(self.cross_modal_alert)
         
-        # Historical trends
+        # Trends
         trends_group = QGroupBox("Health Trends")
         trends_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         trends_layout = QVBoxLayout(trends_group)
@@ -370,7 +791,7 @@ class HealthPassportWidget(QWidget):
         
         layout.addWidget(trends_group)
         
-        # Scan history table
+        # History table
         history_group = QGroupBox("Scan History")
         history_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         history_layout = QVBoxLayout(history_group)
@@ -400,11 +821,9 @@ class HealthPassportWidget(QWidget):
         export_btn.clicked.connect(self._export_report)
         layout.addWidget(export_btn)
         
-        # Refresh patient list
         self._refresh_patient_list()
     
     def _load_records(self):
-        """Load health passport records from file"""
         if self.records_file.exists():
             try:
                 with open(self.records_file, 'r') as f:
@@ -414,7 +833,6 @@ class HealthPassportWidget(QWidget):
         return {}
     
     def _save_records(self):
-        """Save health passport records to file"""
         try:
             with open(self.records_file, 'w') as f:
                 json.dump(self.patient_records, f, indent=2)
@@ -422,7 +840,6 @@ class HealthPassportWidget(QWidget):
             print(f"Error saving records: {e}")
     
     def _refresh_patient_list(self):
-        """Update patient dropdown"""
         self.patient_combo.clear()
         patients = list(self.patient_records.keys())
         if patients:
@@ -432,15 +849,13 @@ class HealthPassportWidget(QWidget):
             self.patient_combo.addItem("No patients")
     
     def _create_new_patient(self):
-        """Create a new patient record"""
         name, ok = QInputDialog.getText(self, "New Patient", "Enter patient name:")
         if ok and name.strip():
             patient_id = name.strip()
             if patient_id not in self.patient_records:
                 self.patient_records[patient_id] = {
                     'created': datetime.now().isoformat(),
-                    'scans': [],
-                    'skin_scans': []  # For cross-modal data from NOMA AI
+                    'scans': []
                 }
                 self._save_records()
                 self._refresh_patient_list()
@@ -448,53 +863,13 @@ class HealthPassportWidget(QWidget):
                 QMessageBox.information(self, "Success", f"Patient {patient_id} created")
     
     def _on_patient_selected(self, patient_name):
-        """Load and display selected patient's records"""
         self.current_patient_id = patient_name
         if patient_name and patient_name in self.patient_records:
             self._display_patient_records(patient_name)
-            self._check_cross_modal_alerts(patient_name)
-    
-    def _check_cross_modal_alerts(self, patient_name):
-        """Check for cross-modal alerts from NOMA AI skin scans"""
-        records = self.patient_records.get(patient_name, {})
-        skin_scans = records.get('skin_scans', [])
-        
-        if skin_scans:
-            # Check for high-risk skin findings
-            high_risk_scans = [s for s in skin_scans if s.get('risk_level') == 'high' or s.get('confidence', 0) > 0.7]
-            if high_risk_scans:
-                latest = high_risk_scans[-1]
-                self.cross_modal_alert.setText(
-                    f"⚠️ CROSS-MODAL ALERT\n"
-                    f"NOMA AI detected a high-risk skin lesion on {latest.get('date', 'unknown date')}.\n"
-                    f"Paraneoplastic syndrome possible. Consider integrated clinical evaluation."
-                )
-                self.cross_modal_alert.show()
-            else:
-                self.cross_modal_alert.hide()
-        else:
-            self.cross_modal_alert.hide()
-    
-    def add_skin_scan_from_sync(self, skin_scan_data):
-        """Add a skin scan received from NOMA AI via sync"""
-        if not self.current_patient_id:
-            # If no patient selected, create a default one
-            self._create_new_patient()
-        
-        if self.current_patient_id and self.current_patient_id in self.patient_records:
-            if 'skin_scans' not in self.patient_records[self.current_patient_id]:
-                self.patient_records[self.current_patient_id]['skin_scans'] = []
-            
-            self.patient_records[self.current_patient_id]['skin_scans'].append(skin_scan_data)
-            self._save_records()
-            self._check_cross_modal_alerts(self.current_patient_id)
-            self._display_patient_records(self.current_patient_id)
     
     def _display_patient_records(self, patient_name):
-        """Display all records for a patient"""
         records = self.patient_records.get(patient_name, {})
         scans = records.get('scans', [])
-        skin_scans = records.get('skin_scans', [])
         
         if not scans:
             self.recent_date_label.setText("No scans recorded")
@@ -502,55 +877,45 @@ class HealthPassportWidget(QWidget):
             self.recent_confidence_label.setText("")
             self.recent_trend_label.setText("")
             self.trends_text.clear()
-        else:
-            # Most recent scan
-            latest = scans[-1]
-            scan_date = latest.get('date', 'Unknown')
-            dx = latest.get('diagnosis', 'Unknown')
-            confidence = latest.get('confidence', 0)
-            
-            self.recent_date_label.setText(f"Date: {scan_date[:16]}")
-            self.recent_dx_label.setText(f"Diagnosis: {dx.upper()}")
-            self.recent_confidence_label.setText(f"Confidence: {confidence:.1%}")
-            
-            # Show trend
-            if len(scans) >= 2:
-                prev = scans[-2]
-                prev_dx = prev.get('diagnosis', 'Unknown')
-                if prev_dx == dx:
-                    self.recent_trend_label.setText("Trend: Stable (same diagnosis)")
-                    self.recent_trend_label.setStyleSheet("font-size: 11px; color: #4caf50;")
-                else:
-                    self.recent_trend_label.setText(f"Trend: Changed from {prev_dx.upper()} to {dx.upper()}")
-                    self.recent_trend_label.setStyleSheet("font-size: 11px; color: #ff9800;")
-            else:
-                self.recent_trend_label.setText("First scan - baseline established")
-                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #2196f3;")
-            
-            # Generate trend analysis
-            self._update_trend_analysis(scans)
+            self.history_table.clear()
+            return
         
-        # Update history table (including skin scans if available)
-        self._update_history_table(scans, skin_scans)
+        latest = scans[-1]
+        scan_date = latest.get('date', 'Unknown')
+        dx = latest.get('diagnosis', 'Unknown')
+        confidence = latest.get('confidence', 0)
+        
+        self.recent_date_label.setText(f"Date: {scan_date[:16]}")
+        self.recent_dx_label.setText(f"Diagnosis: {dx.upper()}")
+        self.recent_confidence_label.setText(f"Confidence: {confidence:.1%}")
+        
+        if len(scans) >= 2:
+            prev = scans[-2]
+            prev_dx = prev.get('diagnosis', 'Unknown')
+            if prev_dx == dx:
+                self.recent_trend_label.setText("Trend: Stable (same diagnosis)")
+                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #4caf50;")
+            else:
+                self.recent_trend_label.setText(f"Trend: Changed from {prev_dx.upper()} to {dx.upper()}")
+                self.recent_trend_label.setStyleSheet("font-size: 11px; color: #ff9800;")
+        else:
+            self.recent_trend_label.setText("First scan - baseline established")
+            self.recent_trend_label.setStyleSheet("font-size: 11px; color: #2196f3;")
+        
+        self._update_trend_analysis(scans)
+        self._update_history_table(scans)
     
     def _update_trend_analysis(self, scans):
-        """Analyze health trends over time"""
         if len(scans) < 2:
             self.trends_text.setText("Not enough data for trend analysis.\nComplete more scans to see trends.")
             return
         
         trend_text = ""
-        
-        # Calculate trend
         recent_3 = scans[-3:] if len(scans) >= 3 else scans
         recent_dxs = [s.get('diagnosis', 'Unknown') for s in recent_3]
         
-        # Check for improvement/deterioration
         if 'pneumonia' in recent_dxs and 'healthy' not in recent_dxs:
             trend_text += "- Current symptoms suggest active infection\n"
-        elif 'healthy' in recent_dxs and 'pneumonia' in recent_dxs[:2]:
-            trend_text += "- Improving condition detected\n"
-        
         if 'asthma' in recent_dxs or 'copd' in recent_dxs:
             trend_text += "- Chronic respiratory pattern detected\n"
             trend_text += "- Regular monitoring recommended\n"
@@ -565,35 +930,23 @@ class HealthPassportWidget(QWidget):
         
         self.trends_text.setText(trend_text)
     
-    def _update_history_table(self, scans, skin_scans):
-        """Display scan history in table format"""
-        if not scans and not skin_scans:
+    def _update_history_table(self, scans):
+        if not scans:
             self.history_table.setText("No scans recorded")
             return
         
-        # Create table header
-        table = "Date                 | Type      | Diagnosis      | Confidence | Result\n"
-        table += "-" * 80 + "\n"
+        table = "Date                 | Diagnosis      | Confidence | Result\n"
+        table += "-" * 70 + "\n"
         
-        # Show lung scans
-        for scan in reversed(scans[-5:]):
+        for scan in reversed(scans[-10:]):
             date = scan.get('date', 'Unknown')[:16]
             dx = scan.get('diagnosis', 'Unknown')[:14]
             conf = f"{scan.get('confidence', 0):.0%}"
-            table += f"{date:20s} | Lung      | {dx:14s} | {conf:10s} |\n"
-        
-        # Show skin scans from NOMA AI
-        for scan in reversed(skin_scans[-3:]):
-            date = scan.get('date', 'Unknown')[:16]
-            dx = scan.get('diagnosis', 'Unknown')[:14]
-            conf = f"{scan.get('confidence', 0):.0%}"
-            risk = scan.get('risk_level', 'unknown')[:8]
-            table += f"{date:20s} | Skin      | {dx:14s} | {conf:10s} | Risk: {risk}\n"
+            table += f"{date:20s} {dx:14s} {conf:10s}\n"
         
         self.history_table.setText(table)
     
     def add_scan_record(self, diagnosis, confidence, microwave_result, audio_result, audio_probs=None):
-        """Add a new scan record for the current patient"""
         if not self.current_patient_id or self.current_patient_id not in self.patient_records:
             if not self.current_patient_id:
                 self._create_new_patient()
@@ -602,11 +955,9 @@ class HealthPassportWidget(QWidget):
             if self.current_patient_id not in self.patient_records:
                 self.patient_records[self.current_patient_id] = {
                     'created': datetime.now().isoformat(),
-                    'scans': [],
-                    'skin_scans': []
+                    'scans': []
                 }
         
-        # Create scan record
         record = {
             'date': datetime.now().isoformat(),
             'diagnosis': diagnosis,
@@ -616,15 +967,11 @@ class HealthPassportWidget(QWidget):
             'audio_probs': audio_probs.tolist() if audio_probs is not None else None
         }
         
-        # Add to records
         self.patient_records[self.current_patient_id]['scans'].append(record)
         self._save_records()
-        
-        # Refresh display
         self._display_patient_records(self.current_patient_id)
     
     def _export_report(self):
-        """Export health report as CSV"""
         if not self.current_patient_id or self.current_patient_id not in self.patient_records:
             QMessageBox.warning(self, "No Patient", "No patient selected")
             return
@@ -638,29 +985,21 @@ class HealthPassportWidget(QWidget):
         if filepath:
             records = self.patient_records[self.current_patient_id]
             scans = records.get('scans', [])
-            skin_scans = records.get('skin_scans', [])
             
             with open(filepath, 'w', newline='') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Date', 'Scan Type', 'Diagnosis', 'Confidence', 'Details'])
+                writer.writerow(['Date', 'Diagnosis', 'Confidence', 'Microwave Result', 'Audio Result'])
                 for scan in scans:
                     writer.writerow([
                         scan.get('date', ''),
-                        'Lung',
                         scan.get('diagnosis', ''),
                         scan.get('confidence', ''),
-                        scan.get('microwave_result', '')
-                    ])
-                for scan in skin_scans:
-                    writer.writerow([
-                        scan.get('date', ''),
-                        'Skin',
-                        scan.get('diagnosis', ''),
-                        scan.get('confidence', ''),
-                        f"Risk: {scan.get('risk_level', 'unknown')}"
+                        scan.get('microwave_result', ''),
+                        scan.get('audio_result', '')
                     ])
             
             QMessageBox.information(self, "Export Complete", f"Report saved to {filepath}")
+
 
 # =============================================================================
 # SYMPTOM TO CONDITION MAPPING
@@ -731,13 +1070,11 @@ class SymptomToConditionMapper:
         self.secondary_weight = 1.0
     
     def calculate_condition_probabilities(self, patient_symptoms):
-        """Calculate probability for each condition based on reported symptoms"""
         scores = {condition: 0.0 for condition in self.conditions}
         
         for condition in self.conditions:
             score = 0.0
             
-            # Check primary symptoms
             primary_criteria = self.primary_mapping.get(condition, {})
             for symptom_type, expected_values in primary_criteria.items():
                 if symptom_type in patient_symptoms:
@@ -750,7 +1087,6 @@ class SymptomToConditionMapper:
                         if reported in expected_values:
                             score += self.primary_weight
             
-            # Check secondary symptoms
             secondary_criteria = self.secondary_mapping.get(condition, {})
             for symptom_type, expected_values in secondary_criteria.items():
                 if symptom_type in patient_symptoms:
@@ -765,7 +1101,6 @@ class SymptomToConditionMapper:
             
             scores[condition] = score
         
-        # Convert scores to probabilities
         total_score = sum(scores.values())
         if total_score > 0:
             probabilities = {c: scores[c] / total_score for c in self.conditions}
@@ -774,6 +1109,7 @@ class SymptomToConditionMapper:
             probabilities['healthy'] = 1.0
         
         return probabilities, scores
+
 
 # =============================================================================
 # ENHANCED CLINICAL DECISION SUPPORT
@@ -788,7 +1124,6 @@ class EnhancedClinicalDecisionSupport:
         self.symptom_weight = 0.4
     
     def assess(self, ai_probs, patient_symptoms, environmental_quality="normal"):
-        """Combine AI predictions with patient symptoms"""
         if environmental_quality == "poor":
             self.ai_weight = 0.3
             self.symptom_weight = 0.7
@@ -799,10 +1134,8 @@ class EnhancedClinicalDecisionSupport:
             self.ai_weight = 0.6
             self.symptom_weight = 0.4
         
-        # Get symptom-based probabilities
         symptom_probs, _ = self.symptom_mapper.calculate_condition_probabilities(patient_symptoms)
         
-        # Combine AI and symptom probabilities
         final_probs = {}
         for condition in ['asthma', 'copd', 'pneumonia', 'bronchitis', 'healthy']:
             condition_idx = MODEL_CLASSES.index(condition) if condition in MODEL_CLASSES else 0
@@ -810,16 +1143,13 @@ class EnhancedClinicalDecisionSupport:
             symptom_score = symptom_probs.get(condition, 0)
             final_probs[condition] = (self.ai_weight * ai_score) + (self.symptom_weight * symptom_score)
         
-        # Normalize
         total = sum(final_probs.values())
         if total > 0:
             final_probs = {c: p/total for c, p in final_probs.items()}
         
-        # Get final diagnosis
         final_diagnosis = max(final_probs.items(), key=lambda x: x[1])
         final_confidence = final_diagnosis[1]
         
-        # Generate explanation
         explanation = self._generate_explanation(
             final_diagnosis[0], final_probs, ai_probs, symptom_probs, patient_symptoms, environmental_quality
         )
@@ -827,14 +1157,12 @@ class EnhancedClinicalDecisionSupport:
         return final_diagnosis[0], final_confidence, explanation, final_probs
     
     def _generate_explanation(self, final_dx, final_probs, ai_probs, symptom_probs, symptoms, quality):
-        """Generate comprehensive clinical explanation"""
         explanation = "CLINICAL DECISION ANALYSIS\n\n"
         explanation += "=" * 50 + "\n\n"
         
         if quality == "poor":
             explanation += "NOTE: Audio quality was poor. Diagnosis relies more heavily on patient-reported symptoms.\n\n"
         
-        # AI Analysis Section
         ai_dx_idx = np.argmax(ai_probs)
         ai_dx = MODEL_CLASSES[ai_dx_idx]
         ai_conf = ai_probs[ai_dx_idx]
@@ -853,7 +1181,6 @@ class EnhancedClinicalDecisionSupport:
         explanation += sound_findings.get(ai_dx, "   - Abnormal lung sounds detected\n")
         explanation += f"   Confidence in acoustic diagnosis: {ai_conf:.1%}\n\n"
         
-        # Patient Symptoms Section
         explanation += "2. PATIENT-REPORTED SYMPTOMS\n"
         
         symptom_descriptions = {
@@ -873,11 +1200,9 @@ class EnhancedClinicalDecisionSupport:
                 elif value:
                     explanation += f"   - {description}: {value}\n"
         
-        # Symptom-based diagnosis
         symptom_dx = max(symptom_probs.items(), key=lambda x: x[1])
         explanation += f"\n   Symptoms most consistent with: {symptom_dx[0].upper()} ({symptom_dx[1]:.1%})\n\n"
         
-        # Combined Analysis Section
         explanation += "3. COMBINED DIAGNOSIS\n\n"
         explanation += f"   Final Diagnosis: {final_dx.upper()}\n"
         explanation += f"   Overall Confidence: {final_confidence:.1%}\n\n"
@@ -888,33 +1213,17 @@ class EnhancedClinicalDecisionSupport:
         
         if final_dx == ai_dx and final_dx == symptom_dx[0]:
             explanation += f"   AGREEMENT: AI and symptoms both indicate {final_dx.upper()}\n"
-            explanation += "   - High confidence in this diagnosis\n"
         elif final_dx == ai_dx:
             explanation += f"   AI analysis supports {final_dx.upper()}\n"
-            explanation += "   - Your reported symptoms differ somewhat\n"
-            explanation += "   - The acoustic patterns are the primary driver\n"
         elif final_dx == symptom_dx[0]:
             explanation += f"   Your symptoms strongly suggest {final_dx.upper()}\n"
-            explanation += "   - The AI detected different patterns\n"
-            explanation += "   - Consider clinical correlation\n"
         else:
             explanation += "   MIXED FINDINGS - consider clinical correlation\n"
             explanation += f"   - AI suggests {ai_dx.upper()}\n"
             explanation += f"   - Symptoms suggest {symptom_dx[0].upper()}\n"
         
-        # Detailed probabilities table
-        explanation += "\n4. DETAILED PROBABILITIES\n\n"
-        explanation += f"   {'Condition':12s} {'AI':>8s} {'Symptoms':>10s} {'Combined':>10s}\n"
-        explanation += f"   {'-'*12} {'-'*8} {'-'*10} {'-'*10}\n"
-        
-        for condition in ['asthma', 'copd', 'pneumonia', 'bronchitis', 'healthy']:
-            condition_idx = MODEL_CLASSES.index(condition) if condition in MODEL_CLASSES else 0
-            ai_pct = ai_probs[condition_idx] * 100
-            sym_pct = symptom_probs.get(condition, 0) * 100
-            final_pct = final_probs.get(condition, 0) * 100
-            explanation += f"   {condition:12s} {ai_pct:7.1f}% {sym_pct:9.1f}% {final_pct:9.1f}%\n"
-        
         return explanation
+
 
 # =============================================================================
 # CLINICAL ASSESSMENT WIDGET (FIXED SCROLLING)
@@ -952,7 +1261,6 @@ class ClinicalAssessmentWidget(QFrame):
         subtitle.setAlignment(Qt.AlignCenter)
         layout.addWidget(subtitle)
         
-        # Create scroll area with proper settings for all questions to be visible
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -1026,10 +1334,8 @@ class ClinicalAssessmentWidget(QFrame):
                            "Worse when lying down"],
                           "symptom_pattern")
         
-        # Add stretch to push content up, but keep submit button visible
         self.form_layout.addStretch()
         
-        # Submit button - always visible at bottom
         self.submit_btn = QPushButton("SUBMIT ASSESSMENT")
         self.submit_btn.setMinimumHeight(45)
         self.submit_btn.setStyleSheet("""
@@ -1052,7 +1358,6 @@ class ClinicalAssessmentWidget(QFrame):
         layout.addWidget(scroll)
     
     def _add_question(self, question, options, key, multi_select=False):
-        """Add a question to the form"""
         group = QGroupBox(question)
         group.setStyleSheet("""
             QGroupBox { 
@@ -1084,38 +1389,32 @@ class ClinicalAssessmentWidget(QFrame):
         self.form_layout.addWidget(group)
     
     def _on_submit(self):
-        """Collect and emit assessment results"""
         results = {}
         
-        # Breathing difficulty
         if "breathing_difficulty" in self.assessment_data:
             bg = self.assessment_data["breathing_difficulty"]
             selected = bg.checkedButton()
             if selected:
                 results["breathing_difficulty"] = selected.text()
         
-        # Chest sensation
         if "chest_sensation" in self.assessment_data:
             bg = self.assessment_data["chest_sensation"]
             selected = bg.checkedButton()
             if selected:
                 results["chest_sensation"] = selected.text()
         
-        # Cough type
         if "cough_type" in self.assessment_data:
             bg = self.assessment_data["cough_type"]
             selected = bg.checkedButton()
             if selected:
                 results["cough_type"] = selected.text()
         
-        # Lung sounds
         if "lung_sounds" in self.assessment_data:
             bg = self.assessment_data["lung_sounds"]
             selected = bg.checkedButton()
             if selected:
                 results["lung_sounds"] = selected.text()
         
-        # Systemic symptoms (multi-select)
         if "systemic_symptoms" in self.assessment_data:
             selected = []
             for cb in self.assessment_data["systemic_symptoms"]:
@@ -1123,7 +1422,6 @@ class ClinicalAssessmentWidget(QFrame):
                     selected.append(cb.text())
             results["systemic_symptoms"] = selected
         
-        # Symptom pattern
         if "symptom_pattern" in self.assessment_data:
             bg = self.assessment_data["symptom_pattern"]
             selected = bg.checkedButton()
@@ -1134,7 +1432,6 @@ class ClinicalAssessmentWidget(QFrame):
         self.hide()
     
     def show_assessment(self):
-        """Show the assessment widget and reset selections"""
         for key, widget in self.assessment_data.items():
             if isinstance(widget, list):
                 for cb in widget:
@@ -1149,6 +1446,7 @@ class ClinicalAssessmentWidget(QFrame):
         self.show()
         self.raise_()
 
+
 # =============================================================================
 # TUMOR LOCALIZER CLASS
 # =============================================================================
@@ -1160,7 +1458,6 @@ class TumorLocalizer:
         self.antenna_positions = ANTENNA_POSITIONS
     
     def analyze_path_attenuation(self, s21_data, baseline_data):
-        """Analyze which paths have abnormal attenuation"""
         path_attenuation = {}
         path_ratios = {}
         
@@ -1168,7 +1465,6 @@ class TumorLocalizer:
             if path_num in s21_data and baseline_data and path_num in baseline_data:
                 patient_avg = np.mean(s21_data[path_num])
                 baseline_avg = np.mean(baseline_data[path_num])
-                
                 diff = baseline_avg - patient_avg
                 path_attenuation[path_num] = diff
                 path_ratios[path_num] = patient_avg / baseline_avg if baseline_avg != 0 else 1.0
@@ -1185,19 +1481,17 @@ class TumorLocalizer:
         }
     
     def _estimate_location_from_paths(self, sorted_paths):
-        """Estimate tumor location by intersecting most affected paths"""
         if len(sorted_paths) < 1:
             return {'x': 0, 'y': 0, 'description': 'Unable to localize', 'quadrant': 'unknown'}
         
         top_paths = [p[0] for p in sorted_paths[:2]]
-        
         intersections = []
+        
         for path_num in top_paths:
             if path_num in PATH_TO_ANTENNA_PAIR:
                 tx, rx = PATH_TO_ANTENNA_PAIR[path_num]
                 tx_pos = self.antenna_positions[tx]
                 rx_pos = self.antenna_positions[rx]
-                
                 mid_x = (tx_pos[0] + rx_pos[0]) / 2
                 mid_y = (tx_pos[1] + rx_pos[1]) / 2
                 intersections.append((mid_x, mid_y))
@@ -1248,17 +1542,15 @@ class TumorLocalizer:
         return confidence
     
     def generate_bounding_box(self, tumor_location, image_width=350, image_height=350):
-        """Generate bounding box coordinates for visualization"""
         px = int((tumor_location['x'] + 100) / 200 * image_width)
         py = int((tumor_location['y'] + 100) / 200 * image_height)
-        
         box_size = 40
         x1 = max(0, px - box_size // 2)
         y1 = max(0, py - box_size // 2)
         x2 = min(image_width, px + box_size // 2)
         y2 = min(image_height, py + box_size // 2)
-        
         return (x1, y1, x2, y2)
+
 
 # =============================================================================
 # RECONSTRUCTION WIDGET
@@ -1275,7 +1567,6 @@ class ReconstructionWidget(QWidget):
         self.setStyleSheet("background-color: white; border: 2px solid #4fc3f7; border-radius: 10px;")
     
     def reconstruct_image(self, s21_data, frequencies, baseline_data=None):
-        """Simple delay-and-sum reconstruction using magnitude data"""
         try:
             grid_size = 80
             x_grid = np.linspace(-100, 100, grid_size)
@@ -1293,7 +1584,6 @@ class ReconstructionWidget(QWidget):
                 tx_pos = ANTENNA_POSITIONS[tx_ant]
                 rx_pos = ANTENNA_POSITIONS[rx_ant]
                 
-                # Convert dB to linear
                 s21_linear = db_to_linear(s21)
                 
                 if baseline_data and path_num in baseline_data:
@@ -1303,12 +1593,9 @@ class ReconstructionWidget(QWidget):
                 for i in range(grid_size):
                     for j in range(grid_size):
                         point = (X[i, j], Y[i, j])
-                        
                         d_tx = np.sqrt((tx_pos[0] - point[0])**2 + (tx_pos[1] - point[1])**2)
                         d_rx = np.sqrt((rx_pos[0] - point[0])**2 + (rx_pos[1] - point[1])**2)
                         total_dist = (d_tx + d_rx) / 1000
-                        
-                        # Simple delay compensation (magnitude-based)
                         delay = total_dist / c
                         freq_idx = int(np.clip(delay * 1e9 / (STOP_FREQ/1e9) * POINTS, 0, POINTS-1))
                         
@@ -1318,7 +1605,6 @@ class ReconstructionWidget(QWidget):
             image /= len(s21_data)
             image = gaussian_filter(image, sigma=2)
             
-            # Normalize for display
             if image.max() > 0:
                 image = np.clip(image, 0, np.percentile(image, 95))
                 image = (image / image.max()) * 255
@@ -1344,7 +1630,6 @@ class ReconstructionWidget(QWidget):
         
         w = self.width()
         h = self.height()
-        
         painter.fillRect(0, 0, w, h, QColor(255, 255, 255))
         
         if self.reconstruction_data is not None:
@@ -1367,18 +1652,13 @@ class ReconstructionWidget(QWidget):
                 x1, y1, x2, y2 = self.bounding_box
                 painter.setPen(QPen(QColor(255, 0, 0), 3))
                 painter.drawRect(x1, y1, x2 - x1, y2 - y1)
-                
-                center_x = (x1 + x2) // 2
-                center_y = (y1 + y2) // 2
                 painter.setPen(QPen(QColor(255, 0, 0), 2))
-                painter.drawLine(center_x - 10, center_y, center_x + 10, center_y)
-                painter.drawLine(center_x, center_y - 10, center_x, center_y + 10)
-                
+                painter.drawLine((x1 + x2) // 2 - 10, (y1 + y2) // 2, (x1 + x2) // 2 + 10, (y1 + y2) // 2)
+                painter.drawLine((x1 + x2) // 2, (y1 + y2) // 2 - 10, (x1 + x2) // 2, (y1 + y2) // 2 + 10)
                 painter.setPen(QPen(QColor(0, 0, 0), 1))
                 painter.setBrush(QBrush(QColor(255, 255, 255, 200)))
                 painter.drawRect(x1, y1 - 25, 120, 20)
                 painter.drawText(x1 + 5, y1 - 10, f"Confidence: {self.localization_confidence:.0%}")
-        
         else:
             painter.setPen(QPen(QColor(150, 150, 150), 2))
             painter.drawRect(10, 10, w - 20, h - 20)
@@ -1400,6 +1680,7 @@ class ReconstructionWidget(QWidget):
         self.bounding_box = None
         self.localization_confidence = 0
         self.update()
+
 
 # =============================================================================
 # AUDIO PROCESSOR
@@ -1444,7 +1725,6 @@ class AudioProcessor(QThread):
     def run(self):
         try:
             print(f"Recording {self.record_seconds} seconds...")
-            
             sample_count = EXPECTED_AUDIO_SAMPLES
             
             try:
@@ -1510,8 +1790,9 @@ class AudioProcessor(QThread):
         finally:
             self.finished.emit()
 
+
 # =============================================================================
-# EDUCATIONAL WIDGET (Fixed Scrolling)
+# EDUCATIONAL WIDGET
 # =============================================================================
 
 class EducationalWidget(QFrame):
@@ -1562,9 +1843,6 @@ class EducationalWidget(QFrame):
                 background: #4fc3f7;
                 min-height: 20px;
                 border-radius: 5px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                height: 0px;
             }
         """)
         
@@ -1651,6 +1929,7 @@ class EducationalWidget(QFrame):
         self.show()
         self.raise_()
 
+
 # =============================================================================
 # VNA CONTROLLER
 # =============================================================================
@@ -1676,7 +1955,6 @@ class VNADirectController:
             return False
     
     def capture_s21(self, progress_callback=None):
-        """Capture S21 magnitude data"""
         if not self.serial_conn or not self.serial_conn.is_open:
             if not self.connect():
                 return None
@@ -1684,10 +1962,8 @@ class VNADirectController:
         try:
             self.serial_conn.reset_input_buffer()
             self.serial_conn.reset_output_buffer()
-            
             cmd = f"scan {START_FREQ} {STOP_FREQ} {POINTS} 5\r\n"
             self.serial_conn.write(cmd.encode())
-            
             time.sleep(2.0)
             
             data_points = []
@@ -1698,22 +1974,17 @@ class VNADirectController:
             while lines_collected < POINTS and (time.time() - timeout_start) < max_timeout:
                 if self.serial_conn.in_waiting:
                     line = self.serial_conn.readline().decode('ascii', errors='ignore').strip()
-                    
                     if not line or line.startswith('ch>') or line.startswith('scan') or line.startswith('#'):
                         continue
-                    
                     parts = line.split()
                     if len(parts) >= 3:
                         try:
                             s21_real = float(parts[1])
                             s21_imag = float(parts[2])
-                            
                             magnitude = math.sqrt(s21_real**2 + s21_imag**2)
                             magnitude_db = 20 * math.log10(magnitude) if magnitude > 0 else -120
-                            
                             data_points.append(magnitude_db)
                             lines_collected += 1
-                            
                             if progress_callback and lines_collected % 20 == 0:
                                 progress_callback(lines_collected, POINTS)
                         except ValueError:
@@ -1737,6 +2008,7 @@ class VNADirectController:
         if self.serial_conn and self.serial_conn.is_open:
             self.serial_conn.close()
             print("VNA disconnected")
+
 
 # =============================================================================
 # RF SWITCH CONTROLLER
@@ -1767,6 +2039,7 @@ class RFSwitchController:
     def cleanup(self):
         GPIO.cleanup()
         print("GPIO cleaned up")
+
 
 # =============================================================================
 # CSV DATA MANAGER
@@ -1822,6 +2095,7 @@ class CSVDataManager:
                     f.unlink()
         print("All data cleared")
 
+
 # =============================================================================
 # MICROWAVE SCANNER
 # =============================================================================
@@ -1835,7 +2109,6 @@ class MicrowaveScanner:
         self._baseline_data = None
     
     def scan_all_paths(self, save_dir, angle=0, progress_callback=None):
-        """Scan all paths and return magnitude data"""
         data = {}
         total_paths = len(PATHS)
         
@@ -1878,47 +2151,25 @@ class MicrowaveScanner:
         return self.csv_manager.has_baseline() or (self._baseline_data is not None)
     
     def extract_features(self, s21_data):
-        """
-        Extract 840-dim feature vector from magnitude data.
-        This matches your training pipeline exactly.
-        """
-        # Step 1: Concatenate frequency features (4 paths * 201 points = 804)
         freq_features = np.array([s21_data[p] for p in [1, 2, 3, 4]]).reshape(1, -1)
-        
-        # Step 2: Add time-domain features (36 features)
         augmented_features = add_time_domain_features(freq_features)
-        
         return augmented_features[0]
     
     def combine_rotation_features(self, rotation_data):
-        """
-        Combine features from multiple rotations by AVERAGING.
-        This maintains the 840-dim feature vector your model expects.
-        
-        Args:
-            rotation_data: dict of {angle: {path_num: s21_array}}
-        
-        Returns:
-            840-dim feature vector (averaged across rotations)
-        """
         all_freq_features = []
         
         for angle, data in rotation_data.items():
-            # Extract frequency features for this rotation
             freq_features = np.array([data[p] for p in [1, 2, 3, 4]]).reshape(1, -1)
             all_freq_features.append(freq_features)
         
-        # Average across all rotations (preserves 804 dimensions)
-        avg_freq_features = np.mean(all_freq_features, axis=0)  # Shape: (1, 804)
-        
-        # Add time-domain features (36 features)
+        avg_freq_features = np.mean(all_freq_features, axis=0)
         augmented_features = add_time_domain_features(avg_freq_features)
-        
         return augmented_features[0]
     
     def cleanup(self):
         self.switch.cleanup()
         self.vna.close()
+
 
 # =============================================================================
 # FUSION CLASSIFIER
@@ -1938,12 +2189,12 @@ class FusionClassifier:
         print("Fusion model loaded")
     
     def predict(self, mw_features, audio_probs):
-        """Combine 840-dim microwave features + 5-dim audio probs = 845-dim"""
         fusion_vec = np.concatenate([mw_features, audio_probs]).reshape(1, -1)
         scaled = self.scaler.transform(fusion_vec)
         pred = self.model.predict(scaled)[0]
         proba = self.model.predict_proba(scaled)[0]
         return pred, np.max(proba)
+
 
 # =============================================================================
 # MAIN GUI APPLICATION - THORACIS AI
@@ -1972,7 +2223,7 @@ class ThoracisAIMainWindow(QMainWindow):
         # Sync timer to check for incoming skin scans
         self.sync_timer = QTimer()
         self.sync_timer.timeout.connect(self._check_sync_folder)
-        self.sync_timer.start(5000)  # Check every 5 seconds
+        self.sync_timer.start(10000)  # Check every 10 seconds
         
         try:
             self.fusion = FusionClassifier()
@@ -1993,11 +2244,9 @@ class ThoracisAIMainWindow(QMainWindow):
     def _check_sync_folder(self):
         """Check for incoming skin scan data from NOMA AI"""
         skin_scans = check_for_skin_scans()
-        for scan in skin_scans:
-            # Add to health passport
-            self.health_passport.add_skin_scan_from_sync(scan)
-            # Show notification
-            self.status_bar.setText(f"Received skin scan from NOMA AI: {scan.get('diagnosis', 'Unknown')}")
+        if skin_scans:
+            print(f"Received {len(skin_scans)} skin scans from NOMA AI")
+            self.status_bar.setText("New skin scans received from NOMA AI - Check Operation Oracle tab")
     
     def _setup_audio_device(self):
         try:
@@ -2080,8 +2329,9 @@ class ThoracisAIMainWindow(QMainWindow):
         self._add_microwave_tab()
         self._add_audio_tab()
         self._add_fusion_tab()
-        self._add_education_tab()
         self._add_health_passport_tab()
+        self._add_operation_oracle_tab()
+        self._add_education_tab()
         
         exit_btn = QPushButton("EXIT")
         exit_btn.setMinimumHeight(40)
@@ -2134,6 +2384,115 @@ class ThoracisAIMainWindow(QMainWindow):
         
         main_layout.addWidget(left_panel, 7)
         main_layout.addWidget(right_panel, 3)
+    
+    def _add_operation_oracle_tab(self):
+        """Add Operation Oracle unified dashboard tab"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        
+        description = QLabel(
+            "OPERATION ORACLE - UNIFIED PATIENT RECORD\n"
+            "This dashboard integrates data from both Thoracis AI (lung) and NOMA AI (skin).\n"
+            "Cross-modal alerts help detect paraneoplastic syndromes where lung and skin findings co-occur."
+        )
+        description.setWordWrap(True)
+        description.setStyleSheet("font-size: 12px; background-color: #e1f5fe; padding: 10px; border-radius: 8px;")
+        description.setAlignment(Qt.AlignCenter)
+        layout.addWidget(description)
+        
+        open_dashboard_btn = QPushButton("OPEN OPERATION ORACLE DASHBOARD")
+        open_dashboard_btn.setMinimumHeight(60)
+        open_dashboard_btn.setStyleSheet("""
+            QPushButton {
+                font-size: 18px;
+                font-weight: bold;
+                background: #4fc3f7;
+                color: white;
+                border: none;
+                border-radius: 15px;
+                padding: 15px;
+            }
+            QPushButton:hover {
+                background: #29b6f6;
+            }
+        """)
+        open_dashboard_btn.clicked.connect(self._open_oracle_dashboard)
+        layout.addWidget(open_dashboard_btn)
+        
+        # Summary of recent cross-modal findings
+        summary_group = QGroupBox("Recent Cross-Modal Summary")
+        summary_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        summary_layout = QVBoxLayout(summary_group)
+        
+        self.cross_modal_summary = QLabel("Loading...")
+        self.cross_modal_summary.setWordWrap(True)
+        self.cross_modal_summary.setStyleSheet("font-size: 11px; padding: 8px;")
+        summary_layout.addWidget(self.cross_modal_summary)
+        
+        layout.addWidget(summary_group)
+        
+        self.tabs.addTab(tab, "Operation Oracle")
+        self._update_cross_modal_summary()
+    
+    def _update_cross_modal_summary(self):
+        """Update the cross-modal summary text"""
+        try:
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            
+            # Get recent thoracic scans
+            cursor.execute('SELECT diagnosis, risk_level FROM thoracic_scans ORDER BY timestamp DESC LIMIT 3')
+            thoracic = cursor.fetchall()
+            
+            # Get recent skin scans
+            cursor.execute('SELECT diagnosis, risk_level FROM skin_scans_received ORDER BY timestamp DESC LIMIT 3')
+            skin = cursor.fetchall()
+            
+            conn.close()
+            
+            summary = "Recent Thoracic Scans:\n"
+            if thoracic:
+                for dx, risk in thoracic:
+                    summary += f"  - {dx} ({risk})\n"
+            else:
+                summary += "  - No thoracic scans recorded\n"
+            
+            summary += "\nRecent Skin Scans (from NOMA AI):\n"
+            if skin:
+                for dx, risk in skin:
+                    summary += f"  - {dx} ({risk})\n"
+            else:
+                summary += "  - No skin scans received yet\n"
+                summary += "  - Scans will appear automatically when NOMA AI shares them\n"
+            
+            # Check for paraneoplastic concern
+            high_risk_thoracic = any(r[1] in ['HIGH', 'URGENT'] for r in thoracic)
+            high_risk_skin = any(r[1] in ['HIGH', 'URGENT'] for r in skin)
+            
+            if high_risk_thoracic and high_risk_skin:
+                summary += "\nPARANEOPLASTIC SYNDROME ALERT: Both thoracic and skin high-risk findings detected.\n"
+                summary += "Integrated pulmonology-dermatology evaluation recommended."
+            elif high_risk_thoracic:
+                summary += "\nCLINICAL CORRELATION: High-risk thoracic findings. Skin assessment recommended."
+            elif high_risk_skin:
+                summary += "\nCLINICAL CORRELATION: High-risk skin findings. Thoracic assessment recommended."
+            
+            self.cross_modal_summary.setText(summary)
+            
+        except Exception as e:
+            self.cross_modal_summary.setText(f"Error loading summary: {e}")
+    
+    def _open_oracle_dashboard(self):
+        """Open the Operation Oracle dashboard"""
+        try:
+            # Refresh the summary before opening
+            self._update_cross_modal_summary()
+            dashboard = OperationOracleDashboard(self)
+            dashboard.exec_()
+        except Exception as e:
+            QMessageBox.warning(self, "Dashboard Error", f"Could not open Operation Oracle Dashboard: {str(e)}")
     
     def _add_microwave_tab(self):
         tab = QWidget()
@@ -2242,6 +2601,16 @@ class ThoracisAIMainWindow(QMainWindow):
         
         self.tabs.addTab(tab, "Fusion")
     
+    def _add_health_passport_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+        
+        layout.addWidget(self.health_passport)
+        
+        self.tabs.addTab(tab, "Health Passport")
+    
     def _add_education_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -2286,17 +2655,6 @@ class ThoracisAIMainWindow(QMainWindow):
         
         layout.addStretch()
         self.tabs.addTab(tab, "Education")
-    
-    def _add_health_passport_tab(self):
-        """Add Health Passport tab"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setContentsMargins(10, 10, 10, 10)
-        layout.setSpacing(10)
-        
-        layout.addWidget(self.health_passport)
-        
-        self.tabs.addTab(tab, "Health Passport")
     
     def _button_style(self, color):
         return f"""
@@ -2378,7 +2736,6 @@ class ThoracisAIMainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
     
     def _run_multi_angle_scan(self):
-        """Perform scans at multiple rotation angles and combine via averaging"""
         if not self.vna.serial_conn:
             QMessageBox.warning(self, "VNA Error", "VNA not connected.")
             return
@@ -2401,7 +2758,6 @@ class ThoracisAIMainWindow(QMainWindow):
                     self.mw_progress.setValue(int(angle_idx / len(ROTATION_ANGLES) * 50))
                     
                     if angle_idx > 0:
-                        # In production, use a dialog. For now, auto-continue with delay
                         time.sleep(2)
                     
                     data = self.scanner.scan_all_paths(
@@ -2410,26 +2766,15 @@ class ThoracisAIMainWindow(QMainWindow):
                     )
                     
                     all_rotation_data[angle] = data
-                    
-                    # Reconstruct image for this rotation
                     self.reconstruction_widget.reconstruct_image(data, self.scanner.frequencies, baseline)
-                    
                     self.mw_progress.setValue(int((angle_idx + 1) / len(ROTATION_ANGLES) * 50))
                 
                 self.rotation_scans = all_rotation_data
-                
-                # COMBINE FEATURES BY AVERAGING ACROSS ROTATIONS
-                # This preserves the 840-dim feature vector
                 combined_features = self.scanner.combine_rotation_features(all_rotation_data)
                 self.current_mw_features = combined_features
-                
-                # Final reconstruction using averaged data
                 self._reconstruct_from_rotations(all_rotation_data)
                 
-                # Generate localization analysis using averaged data
                 localizer = TumorLocalizer()
-                
-                # Average attenuation across rotations for localization
                 combined_attenuation = {}
                 for angle, data in all_rotation_data.items():
                     analysis = localizer.analyze_path_attenuation(data, baseline)
@@ -2440,20 +2785,16 @@ class ThoracisAIMainWindow(QMainWindow):
                 
                 avg_attenuation = {p: np.mean(v) for p, v in combined_attenuation.items()}
                 sorted_paths = sorted(avg_attenuation.items(), key=lambda x: x[1], reverse=True)
-                
                 tumor_location = localizer._estimate_location_from_paths(sorted_paths)
                 confidence = localizer._calculate_confidence(sorted_paths, {})
-                
                 w = self.reconstruction_widget.width()
                 h = self.reconstruction_widget.height()
                 bounding_box = localizer.generate_bounding_box(tumor_location, w, h)
-                
                 self.reconstruction_widget.set_tumor_localization(tumor_location, confidence, bounding_box)
                 
                 result_text = "MULTI-ANGLE PATIENT SCAN COMPLETE\n\n"
                 result_text += f"Scanned at angles: {ROTATION_ANGLES}\n"
-                result_text += f"Total transmission paths: {len(ROTATION_ANGLES) * 4}\n"
-                result_text += f"Features combined via averaging to maintain 840-dim vector\n\n"
+                result_text += f"Total transmission paths: {len(ROTATION_ANGLES) * 4}\n\n"
                 
                 result_text += "TUMOR LOCALIZATION:\n"
                 if confidence > 0.5:
@@ -2463,17 +2804,8 @@ class ThoracisAIMainWindow(QMainWindow):
                     result_text += "   Most affected paths (averaged across rotations):\n"
                     for path_num, attenuation in sorted_paths[:2]:
                         result_text += f"     Path {path_num}: {attenuation:.1f} dB attenuation\n"
-                    result_text += "\nCLINICAL INTERPRETATION:\n"
-                    result_text += f"   The model identifies an abnormal presence in the {tumor_location['quadrant']} quadrant.\n"
-                    result_text += "   This area shows increased attenuation compared to baseline,\n"
-                    result_text += "   suggesting potential tissue abnormality.\n"
-                    result_text += "   Recommended: Further clinical correlation advised.\n"
                 else:
                     result_text += "   No significant abnormality detected\n"
-                    result_text += f"   Confidence: {confidence:.0%}\n"
-                
-                result_text += f"\nData saved to: {MULTI_ANGLE_DIR}\n"
-                result_text += "\nReady for fusion with acoustic analysis."
                 
                 self.mw_result.setText(result_text)
                 self.mw_status.setText("Multi-angle scan complete")
@@ -2492,9 +2824,7 @@ class ThoracisAIMainWindow(QMainWindow):
         threading.Thread(target=worker, daemon=True).start()
     
     def _reconstruct_from_rotations(self, rotation_data):
-        """Reconstruct image using averaged data from all rotations"""
         try:
-            # Average S21 data across all rotations
             avg_s21 = {p: [] for p in [1, 2, 3, 4]}
             
             for angle, data in rotation_data.items():
@@ -2502,7 +2832,6 @@ class ThoracisAIMainWindow(QMainWindow):
                     if path_num in data:
                         avg_s21[path_num].append(data[path_num])
             
-            # Compute average for each path
             for path_num in avg_s21:
                 if avg_s21[path_num]:
                     avg_s21[path_num] = np.mean(avg_s21[path_num], axis=0)
@@ -2534,22 +2863,20 @@ class ThoracisAIMainWindow(QMainWindow):
         self.clinical_assessment.show_assessment()
     
     def _on_clinical_assessment(self, patient_symptoms):
-        """Handle completed clinical assessment with enhanced decision support"""
         if self.last_ai_probs is None:
             return
         
         environmental_quality = "normal"
-        
         final_dx, confidence, explanation, all_probs = self.clinical_decision_support.assess(
             self.last_ai_probs, patient_symptoms, environmental_quality
         )
         
         recommendations = {
-            'asthma': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Use prescribed rescue inhaler as needed\n   - Identify and avoid triggers\n   - Consider daily controller medication\n   - Create an asthma action plan\n",
-            'copd': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Smoking cessation (if applicable)\n   - Pulmonary rehabilitation\n   - Use prescribed bronchodilators\n   - Monitor oxygen saturation\n",
-            'pneumonia': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Seek medical evaluation promptly\n   - Antibiotics if bacterial cause confirmed\n   - Rest and hydration\n   - Follow-up chest X-ray\n",
-            'bronchitis': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - Rest and increased fluid intake\n   - Honey or cough suppressants for symptom relief\n   - Avoid irritants (smoke, dust)\n   - See doctor if symptoms persist >3 weeks\n",
-            'healthy': "\n\n5. MANAGEMENT RECOMMENDATIONS\n\n   - No specific treatment needed\n   - Maintain healthy lifestyle\n   - Regular exercise and good nutrition\n   - Annual check-ups recommended\n"
+            'asthma': "\n\nMANAGEMENT RECOMMENDATIONS\n\n   - Use prescribed rescue inhaler as needed\n   - Identify and avoid triggers\n   - Consider daily controller medication\n   - Create an asthma action plan\n",
+            'copd': "\n\nMANAGEMENT RECOMMENDATIONS\n\n   - Smoking cessation (if applicable)\n   - Pulmonary rehabilitation\n   - Use prescribed bronchodilators\n   - Monitor oxygen saturation\n",
+            'pneumonia': "\n\nMANAGEMENT RECOMMENDATIONS\n\n   - Seek medical evaluation promptly\n   - Antibiotics if bacterial cause confirmed\n   - Rest and hydration\n   - Follow-up chest X-ray\n",
+            'bronchitis': "\n\nMANAGEMENT RECOMMENDATIONS\n\n   - Rest and increased fluid intake\n   - Honey or cough suppressants for symptom relief\n   - Avoid irritants (smoke, dust)\n   - See doctor if symptoms persist >3 weeks\n",
+            'healthy': "\n\nMANAGEMENT RECOMMENDATIONS\n\n   - No specific treatment needed\n   - Maintain healthy lifestyle\n   - Regular exercise and good nutrition\n   - Annual check-ups recommended\n"
         }
         
         result_text = "THORACIS AI CLINICAL ASSESSMENT\n\n"
@@ -2561,26 +2888,17 @@ class ThoracisAIMainWindow(QMainWindow):
         
         self.audio_result.setText(result_text)
         self.audio_status.setText(f"Diagnosis: {final_dx.upper()} ({confidence:.1%})")
-        
         self.educational_widget.show_condition(final_dx, confidence)
         
-        # Store for fusion
         final_probs = np.zeros(5)
         for i, condition in enumerate(MODEL_CLASSES):
             if condition in all_probs:
                 final_probs[i] = all_probs[condition]
-        
         self.current_audio_probs = final_probs
         
-        # Save to Health Passport
+        # Save to Health Passport and sync
         mw_result = "Abnormal" if confidence > 0.7 else "Normal"
-        if self.current_mw_features is not None:
-            try:
-                pass
-            except:
-                mw_result = "Not analyzed"
-        else:
-            mw_result = "Not scanned"
+        risk_level = "HIGH" if confidence > 0.8 else "LOW"
         
         self.health_passport.add_scan_record(
             diagnosis=final_dx,
@@ -2590,11 +2908,25 @@ class ThoracisAIMainWindow(QMainWindow):
             audio_probs=final_probs
         )
         
+        # Save to local database
+        try:
+            conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                INSERT INTO thoracic_scans (patient_id, timestamp, diagnosis, confidence, microwave_result, audio_result, risk_level)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (self.health_passport.current_patient_id, datetime.now().isoformat(),
+                  final_dx, confidence, mw_result, final_dx, risk_level))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Database error: {e}")
+        
         # Sync to NOMA AI
         sync_data = {
             'diagnosis': final_dx,
             'confidence': confidence,
-            'timestamp': datetime.now().isoformat(),
+            'risk_level': risk_level,
             'scan_type': 'lung',
             'source': 'THORACIS_AI'
         }
@@ -2602,6 +2934,9 @@ class ThoracisAIMainWindow(QMainWindow):
         
         if self.current_mw_features is not None and self.fusion is not None:
             self.fusion_combine_btn.setEnabled(True)
+        
+        # Update cross-modal summary
+        self._update_cross_modal_summary()
     
     def _on_audio_error(self, error_msg):
         self.audio_result.setText(f"Audio Error: {error_msg}\n\nCheck microphone and try again.")
@@ -2663,16 +2998,11 @@ class ThoracisAIMainWindow(QMainWindow):
                     
                     data = self.scanner.scan_all_paths(MULTI_ANGLE_DIR, angle=angle)
                     all_rotation_data[angle] = data
-                    
                     self.reconstruction_widget.reconstruct_image(data, self.scanner.frequencies, baseline)
                 
                 self.rotation_scans = all_rotation_data
-                
-                # Combine features by averaging across rotations
                 combined_features = self.scanner.combine_rotation_features(all_rotation_data)
                 self.current_mw_features = combined_features
-                
-                # Final reconstruction using averaged data
                 self._reconstruct_from_rotations(all_rotation_data)
                 
                 self.fusion_status.setText("Microwave complete. Now perform acoustic analysis.")
@@ -2699,17 +3029,14 @@ class ThoracisAIMainWindow(QMainWindow):
     def _on_fusion_audio_result(self, probs):
         self.last_ai_probs = probs
         self.clinical_assessment.show_assessment()
-        # Connect assessment to fusion
         self.clinical_assessment.assessment_complete.disconnect(self._on_clinical_assessment)
         self.clinical_assessment.assessment_complete.connect(self._on_fusion_clinical_assessment)
     
     def _on_fusion_clinical_assessment(self, patient_symptoms):
-        """Handle clinical assessment for fusion path"""
         if self.last_ai_probs is None:
             return
         
         environmental_quality = "normal"
-        
         final_dx, confidence, explanation, all_probs = self.clinical_decision_support.assess(
             self.last_ai_probs, patient_symptoms, environmental_quality
         )
@@ -2719,20 +3046,9 @@ class ThoracisAIMainWindow(QMainWindow):
             if condition in all_probs:
                 self.current_audio_probs[i] = all_probs[condition]
         
-        # Save to Health Passport
-        mw_result = "Abnormal" if confidence > 0.7 else "Normal"
-        self.health_passport.add_scan_record(
-            diagnosis=final_dx,
-            confidence=confidence,
-            microwave_result=mw_result,
-            audio_result=final_dx,
-            audio_probs=self.current_audio_probs
-        )
-        
         self.fusion_status.setText("Acoustic complete. Ready for fusion diagnosis.")
         self.fusion_combine_btn.setEnabled(True)
         
-        # Reconnect the original handler
         self.clinical_assessment.assessment_complete.disconnect(self._on_fusion_clinical_assessment)
         self.clinical_assessment.assessment_complete.connect(self._on_clinical_assessment)
     
@@ -2744,7 +3060,6 @@ class ThoracisAIMainWindow(QMainWindow):
         self.fusion_audio_btn.setEnabled(True)
     
     def _run_fusion(self):
-        """Enhanced fusion with clinical interpretation - maps baseline to healthy"""
         if self.current_mw_features is None or self.current_audio_probs is None:
             QMessageBox.warning(self, "Missing Data", "Perform both scans first!")
             return
@@ -2756,95 +3071,25 @@ class ThoracisAIMainWindow(QMainWindow):
         try:
             pred, conf = self.fusion.predict(self.current_mw_features, self.current_audio_probs)
             
-            # CRITICAL: Map baseline (0) to healthy for clinical output
-            # Original classes: 0=baseline, 1=healthy, 2=tumor
+            # Map baseline (0) to healthy for clinical output
             if pred == 0:
                 clinical_result = "healthy"
-                microwave_display = "Normal"
-            elif pred == 1:
-                clinical_result = "healthy"
-                microwave_display = "Normal"
-            else:  # pred == 2
-                clinical_result = "tumor"
-                microwave_display = "Definite Anomaly"
-            
-            # Also map the microwave display text
-            microwave_text = ""
-            if pred == 0:
                 microwave_text = "Normal (baseline reference)"
             elif pred == 1:
+                clinical_result = "healthy"
                 microwave_text = "Normal"
             else:
+                clinical_result = "tumor"
                 microwave_text = "Definite Anomaly"
             
             audio_dx = np.argmax(self.current_audio_probs)
             audio_class = MODEL_CLASSES[audio_dx] if audio_dx < len(MODEL_CLASSES) else "unknown"
             audio_conf = self.current_audio_probs[audio_dx] if audio_dx < len(self.current_audio_probs) else 0
             
-            # Get all audio probabilities for richer interpretation
-            audio_probs_dict = {}
-            for i, cls in enumerate(MODEL_CLASSES):
-                if i < len(self.current_audio_probs):
-                    audio_probs_dict[cls] = self.current_audio_probs[i]
-            
-            # Sort audio probabilities
-            sorted_audio = sorted(audio_probs_dict.items(), key=lambda x: x[1], reverse=True)
-            
-            # ========== ENHANCED CLINICAL INTERPRETATION ==========
-            
-            # Build interpretation based on fusion result + audio signature
-            interpretation = ""
-            clinical_insight = ""
-            
-            if clinical_result == 'tumor':
-                # TUMOR DETECTED - what does the audio suggest?
-                if audio_class == 'pneumonia' and audio_conf > 0.6:
-                    interpretation = "TUMOR PRESENT with PNEUMONIA-like sound signature"
-                    clinical_insight = ("Clinical Insight: The tumor may be causing airway obstruction that mimics pneumonia. "
-                                       "Alternatively, a tumor with superimposed infection is possible. "
-                                       "Further imaging (CT) recommended to distinguish.")
-                elif audio_class == 'asthma' and audio_conf > 0.6:
-                    interpretation = "TUMOR PRESENT with ASTHMA-like sound signature"
-                    clinical_insight = ("Clinical Insight: The tumor may be causing localized wheezing by partially blocking an airway. "
-                                       "This pattern can mimic asthma but is typically unilateral. "
-                                       "Bronchoscopy may be indicated.")
-                elif audio_class == 'copd' and audio_conf > 0.6:
-                    interpretation = "TUMOR PRESENT with COPD-like sound signature"
-                    clinical_insight = ("Clinical Insight: The tumor is affecting airflow dynamics. "
-                                       "Differentiating tumor from COPD exacerbation requires imaging correlation. "
-                                       "Consider pulmonary function testing.")
-                elif audio_class == 'healthy' and audio_conf > 0.6:
-                    interpretation = "TUMOR PRESENT with NORMAL breath sounds"
-                    clinical_insight = ("Clinical Insight: This suggests an early or peripherally located tumor "
-                                       "that hasn't yet affected airway function. "
-                                       "Favorable for early intervention.")
-                elif audio_class == 'bronchial' and audio_conf > 0.6:
-                    interpretation = "TUMOR PRESENT with BRONCHIAL inflammation pattern"
-                    clinical_insight = ("Clinical Insight: Tumor may be irritating the main airways. "
-                                       "The combination suggests possible endobronchial lesion.")
-                else:
-                    interpretation = f"TUMOR PRESENT with {audio_class.upper()} sound signature ({audio_conf:.0%} confidence)"
-                    clinical_insight = ("Clinical Insight: The acoustic pattern suggests functional abnormality "
-                                       "alongside the structural finding. Clinical correlation recommended.")
-            
-            else:  # healthy (includes both baseline and healthy from model)
-                # HEALTHY - but check if audio disagrees
-                if audio_class != 'healthy' and audio_conf > 0.7:
-                    interpretation = "NORMAL STRUCTURE with FUNCTIONAL ABNORMALITY detected"
-                    clinical_insight = (f"Clinical Insight: Microwave shows normal tissue structure, but breath sounds suggest {audio_class}. "
-                                       "This pattern is consistent with functional airway disease (asthma/COPD/bronchitis) "
-                                       "without structural changes. Reassuring for tumor absence, but respiratory symptoms warrant clinical evaluation.")
-                else:
-                    interpretation = "NORMAL lung structure AND function"
-                    clinical_insight = ("Clinical Insight: Both structural (microwave) and functional (acoustic) assessments are normal. "
-                                       "No evidence of tumor or significant airway disease. Continue regular health maintenance.")
-            
-            # Build the enhanced result text
             result_text = "=" * 60 + "\n"
             result_text += "THORACIS AI FUSION DIAGNOSIS\n"
             result_text += "=" * 60 + "\n\n"
             
-            # FINAL CLINICAL OUTPUT - This is what the patient sees first
             if clinical_result == 'tumor':
                 result_text += "FINAL CLINICAL ASSESSMENT: ABNORMAL - TUMOR SUSPECTED\n"
             else:
@@ -2852,25 +3097,9 @@ class ThoracisAIMainWindow(QMainWindow):
             result_text += f"   Overall Confidence: {conf:.1%}\n\n"
             
             result_text += "MULTIMODAL FINDINGS:\n"
-            result_text += "   ┌─────────────────────────────────────────────┐\n"
-            result_text += f"   │ Microwave (Structural): {microwave_text:<28} │\n"
-            result_text += f"   │ Acoustic (Functional): {audio_class.upper():<20} ({audio_conf:.0%}) │\n"
-            result_text += "   └─────────────────────────────────────────────┘\n\n"
+            result_text += f"   Microwave (Structural): {microwave_text}\n"
+            result_text += f"   Acoustic (Functional): {audio_class.upper()} ({audio_conf:.0%})\n\n"
             
-            result_text += "CLINICAL INTERPRETATION:\n"
-            result_text += f"   {interpretation}\n\n"
-            result_text += f"   {clinical_insight}\n\n"
-            
-            # Add audio probability breakdown
-            result_text += "ACOUSTIC SIGNATURE DETAILS:\n"
-            for condition, prob in sorted_audio[:3]:
-                bar_length = int(prob * 20)
-                bar = "█" * bar_length + "░" * (20 - bar_length)
-                result_text += f"   {condition:12s} [{bar}] {prob:.0%}\n"
-            
-            result_text += "\n"
-            
-            # Add tumor localization if available
             if hasattr(self.reconstruction_widget, 'tumor_location') and self.reconstruction_widget.tumor_location:
                 loc = self.reconstruction_widget.tumor_location
                 loc_conf = self.reconstruction_widget.localization_confidence
@@ -2880,12 +3109,10 @@ class ThoracisAIMainWindow(QMainWindow):
                     result_text += f"   Coordinates: ({loc['x']:.0f} mm, {loc['y']:.0f} mm)\n"
                     result_text += f"   Confidence: {loc_conf:.0%}\n\n"
             
-            # Clinical recommendations based on fusion result
             result_text += "RECOMMENDATIONS:\n"
             if clinical_result == 'tumor':
                 result_text += "   - Schedule follow-up with pulmonologist within 2-4 weeks\n"
                 result_text += "   - Consider chest CT for detailed characterization\n"
-                result_text += "   - Document any cough, hemoptysis, or weight changes\n"
             else:
                 if audio_class != 'healthy' and audio_conf > 0.7:
                     result_text += "   - Clinical evaluation for respiratory symptoms\n"
@@ -2900,24 +3127,23 @@ class ThoracisAIMainWindow(QMainWindow):
             result_text += "Operation Oracle | Democratizing Early Detection"
             
             self.fusion_result.setText(result_text)
-            
-            # Update status bar with clear clinical message
-            if clinical_result == 'tumor':
-                self.fusion_status.setText(f"CLINICAL DIAGNOSIS: ABNORMAL - Tumor suspected ({conf:.1%})")
-            else:
-                self.fusion_status.setText(f"CLINICAL DIAGNOSIS: NORMAL - No tumor detected ({conf:.1%})")
-            
-            # Show educational content based on audio
+            self.fusion_status.setText(f"Diagnosis: {clinical_result} ({conf:.1%})")
             self.educational_widget.show_condition(audio_class, audio_conf)
             
-            # Save to Health Passport with clinical label
-            self.health_passport.add_scan_record(
-                diagnosis=clinical_result,
-                confidence=conf,
-                microwave_result=microwave_text,
-                audio_result=audio_class,
-                audio_probs=self.current_audio_probs
-            )
+            # Save to database
+            try:
+                conn = sqlite3.connect('/home/pi/thoracis_longitudinal.db')
+                cursor = conn.cursor()
+                risk_level = "HIGH" if clinical_result == 'tumor' else "LOW"
+                cursor.execute('''
+                    INSERT INTO thoracic_scans (patient_id, timestamp, diagnosis, confidence, microwave_result, audio_result, risk_level)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (self.health_passport.current_patient_id, datetime.now().isoformat(),
+                      clinical_result, conf, microwave_text, audio_class, risk_level))
+                conn.commit()
+                conn.close()
+            except Exception as e:
+                print(f"Database error: {e}")
             
             # Sync to NOMA AI
             sync_data = {
@@ -2925,15 +3151,26 @@ class ThoracisAIMainWindow(QMainWindow):
                 'confidence': conf,
                 'microwave_finding': microwave_text,
                 'audio_finding': audio_class,
-                'timestamp': datetime.now().isoformat(),
+                'risk_level': risk_level,
                 'scan_type': 'lung_fusion',
                 'source': 'THORACIS_AI'
             }
             sync_scan_to_noma(sync_data)
             
+            # Update cross-modal summary
+            self._update_cross_modal_summary()
+            
         except Exception as e:
             self.fusion_result.setText(f"Fusion error: {e}")
             traceback.print_exc()
+    
+    def closeEvent(self, event):
+        print("\nShutting down THORACIS AI: Operation Oracle...")
+        if hasattr(self, 'sync_timer'):
+            self.sync_timer.stop()
+        self.scanner.cleanup()
+        event.accept()
+
 
 # =============================================================================
 # MAIN
