@@ -417,122 +417,231 @@ class DataCollectionModeWidget(QWidget):
         self._setup_ui()
         
     def _setup_ui(self):
-        layout = QVBoxLayout(self)
-        layout.setSpacing(15)
+        # Make the entire widget scrollable to prevent cutoff
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setStyleSheet("""
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+            QScrollBar:vertical {
+                border: none;
+                background: #e0e0e0;
+                width: 12px;
+                margin: 0px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #4fc3f7;
+                min-height: 30px;
+                border-radius: 6px;
+            }
+            QScrollBar::handle:vertical:hover {
+                background: #0288d1;
+            }
+        """)
+        
+        content_widget = QWidget()
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setSpacing(20)
+        content_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Title with larger font
         title = QLabel("RF SWITCH CONTROLLER - Manual Path Control")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #0277bd;")
+        title.setStyleSheet("font-size: 24px; font-weight: bold; color: #0277bd; padding: 10px;")
         title.setAlignment(Qt.AlignCenter)
-        layout.addWidget(title)
+        title.setWordWrap(True)
+        content_layout.addWidget(title)
         
+        # Description with larger font and proper wrapping
         description = QLabel(
             "This controller sets the RF switch paths for manual VNA capture.\n"
             "Run your VNA capture script separately on your computer.\n"
             "Select a path below, then capture data on your computer."
         )
         description.setWordWrap(True)
-        description.setStyleSheet("font-size: 12px; color: #555; padding: 10px; background: #e3f2fd; border-radius: 8px;")
+        description.setStyleSheet("font-size: 14px; color: #333; padding: 15px; background: #e3f2fd; border-radius: 10px;")
         description.setAlignment(Qt.AlignCenter)
-        layout.addWidget(description)
+        content_layout.addWidget(description)
         
-        # Path selection buttons
-        paths_group = QGroupBox("Select RF Path")
-        paths_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
+        # Path selection buttons - LARGER
+        paths_group = QGroupBox("SELECT RF PATH")
+        paths_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                font-size: 16px; 
+                border: 2px solid #4fc3f7;
+                border-radius: 10px;
+                margin-top: 15px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 10px 0 10px;
+            }
+        """)
         paths_layout = QVBoxLayout(paths_group)
+        paths_layout.setSpacing(15)
         
-        # Create large buttons for each path
+        # Path button style - BIGGER
         button_style = """
             QPushButton {
-                font-size: 16px;
+                font-size: 18px;
                 font-weight: bold;
-                padding: 20px;
-                border-radius: 10px;
-                margin: 5px;
+                color: white;
+                border: none;
+                border-radius: 15px;
+                padding: 25px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                opacity: 0.9;
+            }
+            QPushButton:pressed {
+                opacity: 0.7;
             }
         """
         
         self.path_buttons = {}
-        path_info = {
-            1: {"name": "PATH 1", "desc": "Antenna 1 -> Antenna 3 (opposite)", "color": "#4fc3f7"},
-            2: {"name": "PATH 2", "desc": "Antenna 1 -> Antenna 4 (diagonal)", "color": "#81d4fa"},
-            3: {"name": "PATH 3", "desc": "Antenna 2 -> Antenna 3 (diagonal)", "color": "#4fc3f7"},
-            4: {"name": "PATH 4", "desc": "Antenna 2 -> Antenna 4 (opposite)", "color": "#81d4fa"}
-        }
         
-        for path_num, info in path_info.items():
-            btn = QPushButton(f"{info['name']}\n{info['desc']}")
-            btn.setMinimumHeight(80)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    font-size: 14px;
-                    font-weight: bold;
-                    background: {info['color']};
-                    color: white;
-                    border: none;
-                    border-radius: 10px;
-                    padding: 15px;
-                }}
-                QPushButton:hover {{
-                    background: #29b6f6;
-                }}
-                QPushButton:pressed {{
-                    background: #0288d1;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, p=path_num: self._set_path(p))
-            paths_layout.addWidget(btn)
-            self.path_buttons[path_num] = btn
+        # Path 1 button
+        btn1 = QPushButton("PATH 1: Antenna 1 -> Antenna 3 (opposite)")
+        btn1.setMinimumHeight(90)
+        btn1.setStyleSheet(button_style + "background: #4fc3f7;")
+        btn1.setWordWrap(True)
+        btn1.clicked.connect(lambda checked, p=1: self._set_path(p))
+        paths_layout.addWidget(btn1)
+        self.path_buttons[1] = btn1
         
-        layout.addWidget(paths_group)
+        # Path 2 button
+        btn2 = QPushButton("PATH 2: Antenna 1 -> Antenna 4 (diagonal)")
+        btn2.setMinimumHeight(90)
+        btn2.setStyleSheet(button_style + "background: #29b6f6;")
+        btn2.setWordWrap(True)
+        btn2.clicked.connect(lambda checked, p=2: self._set_path(p))
+        paths_layout.addWidget(btn2)
+        self.path_buttons[2] = btn2
         
-        # Status display
-        status_group = QGroupBox("Current Status")
-        status_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 13px; }")
+        # Path 3 button
+        btn3 = QPushButton("PATH 3: Antenna 2 -> Antenna 3 (diagonal)")
+        btn3.setMinimumHeight(90)
+        btn3.setStyleSheet(button_style + "background: #03a9f4;")
+        btn3.setWordWrap(True)
+        btn3.clicked.connect(lambda checked, p=3: self._set_path(p))
+        paths_layout.addWidget(btn3)
+        self.path_buttons[3] = btn3
+        
+        # Path 4 button
+        btn4 = QPushButton("PATH 4: Antenna 2 -> Antenna 4 (opposite)")
+        btn4.setMinimumHeight(90)
+        btn4.setStyleSheet(button_style + "background: #0288d1;")
+        btn4.setWordWrap(True)
+        btn4.clicked.connect(lambda checked, p=4: self._set_path(p))
+        paths_layout.addWidget(btn4)
+        self.path_buttons[4] = btn4
+        
+        content_layout.addWidget(paths_group)
+        
+        # Status display - LARGER
+        status_group = QGroupBox("CURRENT STATUS")
+        status_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                font-size: 15px; 
+                border: 2px solid #ff9800;
+                border-radius: 10px;
+                margin-top: 15px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 10px 0 10px;
+            }
+        """)
         status_layout = QVBoxLayout(status_group)
         
         self.current_path_label = QLabel("No path selected")
-        self.current_path_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #0277bd; padding: 10px;")
+        self.current_path_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #e65100; padding: 15px; background: #fff3e0; border-radius: 8px;")
         self.current_path_label.setAlignment(Qt.AlignCenter)
+        self.current_path_label.setWordWrap(True)
         status_layout.addWidget(self.current_path_label)
         
         self.status_message = QLabel("Ready - Select a path above")
-        self.status_message.setStyleSheet("font-size: 12px; color: #666; padding: 5px;")
+        self.status_message.setStyleSheet("font-size: 14px; color: #2e7d32; padding: 10px; background: #e8f5e9; border-radius: 8px;")
         self.status_message.setAlignment(Qt.AlignCenter)
+        self.status_message.setWordWrap(True)
         status_layout.addWidget(self.status_message)
         
-        layout.addWidget(status_group)
+        content_layout.addWidget(status_group)
         
-        # Instructions
-        instructions = QLabel(
-            "INSTRUCTIONS:\n"
-            "1. Click a path button above to set the RF switch\n"
-            "2. Run your VNA capture script on your computer\n"
-            "3. Repeat for each path (1, 2, 3, 4)\n\n"
-            "Note: The VNA must be connected and powered on."
+        # Instructions - LARGER and SCROLLABLE
+        instructions_group = QGroupBox("INSTRUCTIONS")
+        instructions_group.setStyleSheet("""
+            QGroupBox { 
+                font-weight: bold; 
+                font-size: 14px; 
+                border: 2px solid #66bb6a;
+                border-radius: 10px;
+                margin-top: 15px;
+                padding-top: 15px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 15px;
+                padding: 0 10px 0 10px;
+            }
+        """)
+        instructions_layout = QVBoxLayout(instructions_group)
+        
+        instructions_text = QLabel(
+            "STEP 1: Click a PATH button above to set the RF switch\n\n"
+            "STEP 2: Run your VNA capture script on your computer\n\n"
+            "STEP 3: Repeat for Paths 1, 2, 3, and 4\n\n"
+            "STEP 4: Use RESET button to disable all switches when done\n\n"
+            "NOTE: The VNA must be connected and powered on.\n"
+            "      Each path should be captured separately on your computer."
         )
-        instructions.setWordWrap(True)
-        instructions.setStyleSheet("font-size: 11px; color: #555; background: #fff8e1; padding: 10px; border-radius: 8px;")
-        layout.addWidget(instructions)
+        instructions_text.setWordWrap(True)
+        instructions_text.setStyleSheet("font-size: 13px; color: #333; padding: 15px; line-height: 1.6;")
+        instructions_layout.addWidget(instructions_text)
         
-        # Reset/Disable all button
-        reset_btn = QPushButton("DISABLE ALL SWITCHES (Reset)")
-        reset_btn.setMinimumHeight(40)
+        content_layout.addWidget(instructions_group)
+        
+        # Reset button - LARGER
+        reset_btn = QPushButton("DISABLE ALL SWITCHES (RESET)")
+        reset_btn.setMinimumHeight(70)
         reset_btn.setStyleSheet("""
             QPushButton {
-                font-size: 14px;
+                font-size: 18px;
                 font-weight: bold;
                 background: #ff9800;
                 color: white;
                 border: none;
-                border-radius: 8px;
-                padding: 10px;
+                border-radius: 12px;
+                padding: 15px;
             }
-            QPushButton:hover { background: #f57c00; }
+            QPushButton:hover {
+                background: #f57c00;
+            }
+            QPushButton:pressed {
+                background: #e65100;
+            }
         """)
         reset_btn.clicked.connect(self._disable_all)
-        layout.addWidget(reset_btn)
+        content_layout.addWidget(reset_btn)
         
-        layout.addStretch()
+        content_layout.addStretch()
+        
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll)
     
     def _set_path(self, path_num):
         """Set the RF switch to the selected path"""
@@ -547,39 +656,48 @@ class DataCollectionModeWidget(QWidget):
             }
             
             self.current_path_label.setText(f"ACTIVE: Path {path_num}\n{path_names[path_num]}")
-            self.status_message.setText(f"Path {path_num} set successfully - Ready for VNA capture")
-            self.status_message.setStyleSheet("font-size: 12px; color: #4caf50; padding: 5px;")
+            self.status_message.setText(f"Path {path_num} set successfully - Ready for VNA capture on your computer")
+            self.status_message.setStyleSheet("font-size: 14px; color: #2e7d32; padding: 10px; background: #a5d6a7; border-radius: 8px;")
             
             # Temporarily highlight the pressed button
-            for p, btn in self.path_buttons.items():
-                if p == path_num:
-                    btn.setStyleSheet(btn.styleSheet() + "\nQPushButton { background: #0288d1; }")
-                    QTimer.singleShot(500, lambda: self._reset_button_style(path_num))
+            original_style = self.path_buttons[path_num].styleSheet()
+            self.path_buttons[path_num].setStyleSheet(original_style + "\nQPushButton { background: #ff9800; }")
+            QTimer.singleShot(500, lambda: self._reset_button_style(path_num, original_style))
             
             print(f"[Data Collection] Path {path_num} set: {path_names[path_num]}")
             
         except Exception as e:
-            self.status_message.setText(f"Error setting path: {e}")
-            self.status_message.setStyleSheet("font-size: 12px; color: #f44336; padding: 5px;")
+            self.status_message.setText(f"Error setting path: {str(e)}")
+            self.status_message.setStyleSheet("font-size: 14px; color: #c62828; padding: 10px; background: #ffcdd2; border-radius: 8px;")
             print(f"Error setting path {path_num}: {e}")
     
-    def _reset_button_style(self, path_num):
+    def _reset_button_style(self, path_num, original_style):
         """Reset button style after highlight"""
-        colors = {1: "#4fc3f7", 2: "#81d4fa", 3: "#4fc3f7", 4: "#81d4fa"}
+        colors = {
+            1: "#4fc3f7",
+            2: "#29b6f6", 
+            3: "#03a9f4",
+            4: "#0288d1"
+        }
         self.path_buttons[path_num].setStyleSheet(f"""
             QPushButton {{
-                font-size: 14px;
+                font-size: 18px;
                 font-weight: bold;
-                background: {colors[path_num]};
                 color: white;
                 border: none;
-                border-radius: 10px;
-                padding: 15px;
+                border-radius: 15px;
+                padding: 25px;
+                text-align: left;
+                background: {colors[path_num]};
             }}
             QPushButton:hover {{
-                background: #29b6f6;
+                opacity: 0.9;
+            }}
+            QPushButton:pressed {{
+                opacity: 0.7;
             }}
         """)
+        self.path_buttons[path_num].setWordWrap(True)
     
     def _disable_all(self):
         """Disable all switches (set all GPIO pins to LOW)"""
@@ -588,11 +706,13 @@ class DataCollectionModeWidget(QWidget):
             for pin in [17, 27, 18, 22]:
                 GPIO.output(pin, GPIO.LOW)
             self.current_path_label.setText("All switches disabled")
-            self.status_message.setText("All switches set to OFF - System reset")
-            self.status_message.setStyleSheet("font-size: 12px; color: #ff9800; padding: 5px;")
+            self.current_path_label.setStyleSheet("font-size: 20px; font-weight: bold; color: #e65100; padding: 15px; background: #fff3e0; border-radius: 8px;")
+            self.status_message.setText("All switches set to OFF - System reset complete")
+            self.status_message.setStyleSheet("font-size: 14px; color: #e65100; padding: 10px; background: #ffe0b2; border-radius: 8px;")
             print("All switches disabled")
         except Exception as e:
-            self.status_message.setText(f"Error resetting: {e}")
+            self.status_message.setText(f"Error resetting: {str(e)}")
+            self.status_message.setStyleSheet("font-size: 14px; color: #c62828; padding: 10px; background: #ffcdd2; border-radius: 8px;")
             print(f"Error resetting switches: {e}")
 
 # =============================================================================
